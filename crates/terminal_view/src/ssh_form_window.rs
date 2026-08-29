@@ -1,3 +1,7 @@
+use connection_form::team::{
+    TeamSelectItem, create_team_select, refresh_team_options, refresh_teams_tooltip,
+    resolve_team_assignment, selected_team_id, team_label,
+};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, FocusHandle, Focusable, InteractiveElement,
@@ -5,17 +9,18 @@ use gpui::{
     WeakEntity, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, Sizable, Size, TitleBar,
+    ActiveTheme, Disableable, IconName, Sizable, Size,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
     input::{Input, InputState},
     radio::Radio,
+    scroll::ScrollableElement,
     select::{Select, SelectItem, SelectState},
     tab::{Tab, TabBar},
     v_flex,
 };
-use one_core::cloud_sync::{GlobalCloudUser, TeamOption};
+use one_core::cloud_sync::TeamOption;
 use one_core::connection_notifier::{ConnectionDataEvent, get_notifier};
 use one_core::gpui_tokio::Tokio;
 use one_core::storage::traits::Repository;
@@ -26,20 +31,62 @@ use one_core::storage::{
 use rust_i18n::t;
 use ssh::{
     JumpServerConnectConfig, ProxyConnectConfig, ProxyType, RusshClient, SshAuth, SshClient,
-    SshConnectConfig,
+    SshConnectConfig, SshSessionManager,
 };
 use std::sync::Arc;
 use std::time::Duration;
+use terminal::SshBackend;
 
 use crate::ssh_form_mfa::{
     CapturedMfaRequest, FormMfaPrompt, FormMfaRequest, JumpServerMfaResponder,
     form_mfa_request_from_keyboard_interactive, is_jump_mfa_required_error,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshFormPostSaveAction {
+    Close,
+    Continue,
+}
+
+pub type SshFormSavedCallback = Arc<
+    dyn Fn(StoredConnection, SshFormPostSaveAction, &mut Window, &mut App) + Send + Sync + 'static,
+>;
+
 pub struct SshFormWindowConfig {
     pub editing_connection: Option<StoredConnection>,
+    pub initial_connection: Option<StoredConnection>,
+    pub on_saved: Option<SshFormSavedCallback>,
     pub workspaces: Vec<Workspace>,
     pub teams: Vec<TeamOption>,
+}
+
+impl SshFormWindowConfig {
+    pub fn is_editing(&self) -> bool {
+        self.editing_connection.is_some()
+    }
+
+    pub fn supports_save_and_continue(&self) -> bool {
+        self.on_saved.is_some()
+    }
+
+    fn connection_to_load(&self) -> Option<&StoredConnection> {
+        self.editing_connection
+            .as_ref()
+            .or(self.initial_connection.as_ref())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveAction {
+    Close,
+    Continue,
+}
+
+fn post_save_action(action: SaveAction) -> SshFormPostSaveAction {
+    match action {
+        SaveAction::Close => SshFormPostSaveAction::Close,
+        SaveAction::Continue => SshFormPostSaveAction::Continue,
+    }
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -76,47 +123,13 @@ impl SelectItem for WorkspaceSelectItem {
     }
 }
 
-#[derive(Clone, Default, PartialEq)]
-struct TeamSelectItem {
-    id: Option<String>,
-    name: String,
-}
-
-impl TeamSelectItem {
-    fn personal() -> Self {
-        Self {
-            id: None,
-            name: t!("TeamSync.personal").to_string(),
-        }
-    }
-
-    fn from_team(team: &TeamOption) -> Self {
-        Self {
-            id: Some(team.id.clone()),
-            name: team.name.clone(),
-        }
-    }
-}
-
-impl SelectItem for TeamSelectItem {
-    type Value = Option<String>;
-
-    fn title(&self) -> SharedString {
-        self.name.clone().into()
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.id
-    }
-}
-
 pub struct SshFormWindow {
     focus_handle: FocusHandle,
-    title: SharedString,
     is_editing: bool,
     editing_id: Option<i64>,
     editing_cloud_id: Option<String>,
     editing_last_synced_at: Option<i64>,
+    editing_owner_id: Option<String>,
 
     // 当前活动标签页索引
     active_tab: usize,
@@ -128,6 +141,7 @@ pub struct SshFormWindow {
     username_input: Entity<InputState>,
     password_input: Entity<InputState>,
     key_path_input: Entity<InputState>,
+    private_key_content_input: Entity<InputState>,
     passphrase_input: Entity<InputState>,
 
     auth_method: AuthMethodSelection,
@@ -136,10 +150,14 @@ pub struct SshFormWindow {
 
     // 跳板机设置
     enable_jump_server: bool,
+    jump_auth_method: AuthMethodSelection,
     jump_host_input: Entity<InputState>,
     jump_port_input: Entity<InputState>,
     jump_username_input: Entity<InputState>,
     jump_password_input: Entity<InputState>,
+    jump_key_path_input: Entity<InputState>,
+    jump_private_key_content_input: Entity<InputState>,
+    jump_passphrase_input: Entity<InputState>,
     jump_mfa_request: Option<FormMfaRequest>,
     jump_mfa_inputs: Vec<JumpMfaInput>,
     jump_mfa_signature: Option<String>,
@@ -173,7 +191,11 @@ pub struct SshFormWindow {
     disable_shell_integration: bool,
 
     is_testing: bool,
+    is_uninstalling_shell_integration: bool,
     test_result: Option<Result<(), String>>,
+    shell_integration_uninstall_result: Option<Result<(), String>>,
+    on_saved: Option<SshFormSavedCallback>,
+    save_action: SaveAction,
 }
 
 #[derive(Clone)]
@@ -187,16 +209,75 @@ pub enum AuthMethodSelection {
     #[default]
     Password,
     PrivateKey,
+    PrivateKeyContent,
     Agent,
     AutoPublicKey,
 }
 
 fn build_connection_test_signature(params: &SshParams) -> String {
-    format!("{:?}", params)
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash as _, Hasher as _};
+
+    let mut hasher = DefaultHasher::new();
+    format!("{:?}", params).hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
-fn validate_save_state(is_testing: bool) -> Result<(), &'static str> {
-    if is_testing { Err("testing") } else { Ok(()) }
+fn format_connection_error(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+}
+
+fn validate_save_state(
+    is_testing: bool,
+    is_uninstalling_shell_integration: bool,
+) -> Result<(), &'static str> {
+    if is_testing {
+        Err("testing")
+    } else if is_uninstalling_shell_integration {
+        Err("uninstalling_shell_integration")
+    } else {
+        Ok(())
+    }
+}
+
+fn save_block_message(reason: &str) -> String {
+    match reason {
+        "testing" => t!("SSH.save_while_testing").to_string(),
+        "uninstalling_shell_integration" => {
+            t!("SSH.save_while_uninstalling_shell_integration").to_string()
+        }
+        _ => t!("SSH.validation_error").to_string(),
+    }
+}
+
+fn build_jump_auth_method(
+    auth_method: AuthMethodSelection,
+    password: String,
+    key_path: String,
+    private_key: String,
+    passphrase: String,
+) -> SshAuthMethod {
+    match auth_method {
+        AuthMethodSelection::Password => SshAuthMethod::Password { password },
+        AuthMethodSelection::PrivateKey => SshAuthMethod::PrivateKey {
+            key_path,
+            passphrase: if passphrase.is_empty() {
+                None
+            } else {
+                Some(passphrase)
+            },
+        },
+        AuthMethodSelection::PrivateKeyContent => SshAuthMethod::PrivateKeyContent {
+            private_key,
+            passphrase: if passphrase.is_empty() {
+                None
+            } else {
+                Some(passphrase)
+            },
+        },
+        AuthMethodSelection::Agent => SshAuthMethod::Agent,
+        AuthMethodSelection::AutoPublicKey => SshAuthMethod::AutoPublicKey,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -208,7 +289,8 @@ pub enum ProxyTypeSelection {
 
 impl SshFormWindow {
     pub fn new(config: SshFormWindowConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let is_editing = config.editing_connection.is_some();
+        let is_editing = config.is_editing();
+        let on_saved = config.on_saved.clone();
         let editing_id = config.editing_connection.as_ref().and_then(|c| c.id);
         let editing_cloud_id = config
             .editing_connection
@@ -218,13 +300,10 @@ impl SshFormWindow {
             .editing_connection
             .as_ref()
             .and_then(|c| c.last_synced_at);
-
-        let title: SharedString = if is_editing {
-            t!("SSH.edit").to_string()
-        } else {
-            t!("SSH.new").to_string()
-        }
-        .into();
+        let editing_owner_id = config
+            .editing_connection
+            .as_ref()
+            .and_then(|c| c.owner_id.clone());
 
         // 基本信息
         let name_input =
@@ -245,6 +324,11 @@ impl SshFormWindow {
         });
         let key_path_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t!("SSH.key_path_placeholder")));
+        let private_key_content_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!("SSH.private_key_content_placeholder"))
+                .auto_grow(6, 12)
+        });
         let passphrase_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(t!("SSH.passphrase_placeholder"))
@@ -264,6 +348,18 @@ impl SshFormWindow {
         let jump_password_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(t!("SSH.password_placeholder"))
+                .masked(true)
+        });
+        let jump_key_path_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("SSH.key_path_placeholder")));
+        let jump_private_key_content_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!("SSH.private_key_content_placeholder"))
+                .auto_grow(6, 12)
+        });
+        let jump_passphrase_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!("SSH.passphrase_placeholder"))
                 .masked(true)
         });
 
@@ -327,12 +423,10 @@ impl SshFormWindow {
         let workspace_select =
             cx.new(|cx| SelectState::new(workspace_items, Some(Default::default()), window, cx));
 
-        let mut team_items = vec![TeamSelectItem::personal()];
-        team_items.extend(config.teams.iter().map(TeamSelectItem::from_team));
-        let team_select =
-            cx.new(|cx| SelectState::new(team_items, Some(Default::default()), window, cx));
+        let team_select = create_team_select(&config.teams, None, window, cx);
 
         let mut auth_method = AuthMethodSelection::Password;
+        let mut jump_auth_method = AuthMethodSelection::Password;
         let mut workspace_id: Option<i64> = None;
         let mut enable_jump_server = false;
         let mut enable_proxy = false;
@@ -340,7 +434,7 @@ impl SshFormWindow {
         let mut sync_enabled = true; // 默认启用云同步
         let mut disable_shell_integration = false;
 
-        if let Some(ref conn) = config.editing_connection {
+        if let Some(conn) = config.connection_to_load() {
             // 加载同步状态
             sync_enabled = conn.sync_enabled;
 
@@ -363,6 +457,17 @@ impl SshFormWindow {
                     } => {
                         auth_method = AuthMethodSelection::PrivateKey;
                         key_path_input.update(cx, |s, cx| s.set_value(key_path, window, cx));
+                        if let Some(ref pass) = passphrase {
+                            passphrase_input.update(cx, |s, cx| s.set_value(pass, window, cx));
+                        }
+                    }
+                    SshAuthMethod::PrivateKeyContent {
+                        ref private_key,
+                        ref passphrase,
+                    } => {
+                        auth_method = AuthMethodSelection::PrivateKeyContent;
+                        private_key_content_input
+                            .update(cx, |s, cx| s.set_value(private_key, window, cx));
                         if let Some(ref pass) = passphrase {
                             passphrase_input.update(cx, |s, cx| s.set_value(pass, window, cx));
                         }
@@ -405,8 +510,42 @@ impl SshFormWindow {
                     jump_port_input
                         .update(cx, |s, cx| s.set_value(&jump.port.to_string(), window, cx));
                     jump_username_input.update(cx, |s, cx| s.set_value(&jump.username, window, cx));
-                    if let SshAuthMethod::Password { ref password } = jump.auth_method {
-                        jump_password_input.update(cx, |s, cx| s.set_value(password, window, cx));
+                    match jump.auth_method {
+                        SshAuthMethod::Password { ref password } => {
+                            jump_auth_method = AuthMethodSelection::Password;
+                            jump_password_input
+                                .update(cx, |s, cx| s.set_value(password, window, cx));
+                        }
+                        SshAuthMethod::PrivateKey {
+                            ref key_path,
+                            ref passphrase,
+                        } => {
+                            jump_auth_method = AuthMethodSelection::PrivateKey;
+                            jump_key_path_input
+                                .update(cx, |s, cx| s.set_value(key_path, window, cx));
+                            if let Some(ref pass) = passphrase {
+                                jump_passphrase_input
+                                    .update(cx, |s, cx| s.set_value(pass, window, cx));
+                            }
+                        }
+                        SshAuthMethod::PrivateKeyContent {
+                            ref private_key,
+                            ref passphrase,
+                        } => {
+                            jump_auth_method = AuthMethodSelection::PrivateKeyContent;
+                            jump_private_key_content_input
+                                .update(cx, |s, cx| s.set_value(private_key, window, cx));
+                            if let Some(ref pass) = passphrase {
+                                jump_passphrase_input
+                                    .update(cx, |s, cx| s.set_value(pass, window, cx));
+                            }
+                        }
+                        SshAuthMethod::Agent => {
+                            jump_auth_method = AuthMethodSelection::Agent;
+                        }
+                        SshAuthMethod::AutoPublicKey => {
+                            jump_auth_method = AuthMethodSelection::AutoPublicKey;
+                        }
                     }
                 }
 
@@ -451,11 +590,11 @@ impl SshFormWindow {
 
         Self {
             focus_handle: cx.focus_handle(),
-            title,
             is_editing,
             editing_id,
             editing_cloud_id,
             editing_last_synced_at,
+            editing_owner_id,
             active_tab: 0,
             name_input,
             host_input,
@@ -463,15 +602,20 @@ impl SshFormWindow {
             username_input,
             password_input,
             key_path_input,
+            private_key_content_input,
             passphrase_input,
             auth_method,
             workspace_select,
             team_select,
             enable_jump_server,
+            jump_auth_method,
             jump_host_input,
             jump_port_input,
             jump_username_input,
             jump_password_input,
+            jump_key_path_input,
+            jump_private_key_content_input,
+            jump_passphrase_input,
             jump_mfa_request: None,
             jump_mfa_inputs: Vec::new(),
             jump_mfa_signature: None,
@@ -491,7 +635,11 @@ impl SshFormWindow {
             sync_enabled,
             disable_shell_integration,
             is_testing: false,
+            is_uninstalling_shell_integration: false,
             test_result: None,
+            shell_integration_uninstall_result: None,
+            on_saved,
+            save_action: SaveAction::Close,
         }
     }
 
@@ -504,11 +652,11 @@ impl SshFormWindow {
     }
 
     fn get_team_id(&self, cx: &App) -> Option<String> {
-        self.team_select
-            .read(cx)
-            .selected_value()
-            .cloned()
-            .flatten()
+        selected_team_id(&self.team_select, cx)
+    }
+
+    fn request_team_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        refresh_team_options(&self.team_select, window, cx);
     }
 
     fn build_ssh_params(&self, cx: &App) -> Option<SshParams> {
@@ -539,6 +687,17 @@ impl SshFormWindow {
                 };
                 SshAuthMethod::PrivateKey {
                     key_path,
+                    passphrase,
+                }
+            }
+            AuthMethodSelection::PrivateKeyContent => {
+                let private_key = self.private_key_content_input.read(cx).text().to_string();
+                let passphrase = {
+                    let p = self.passphrase_input.read(cx).text().to_string();
+                    if p.is_empty() { None } else { Some(p) }
+                };
+                SshAuthMethod::PrivateKeyContent {
+                    private_key,
                     passphrase,
                 }
             }
@@ -592,13 +751,24 @@ impl SshFormWindow {
                     .parse()
                     .unwrap_or(22);
                 let jump_password = self.jump_password_input.read(cx).text().to_string();
+                let jump_key_path = self.jump_key_path_input.read(cx).text().to_string();
+                let jump_private_key = self
+                    .jump_private_key_content_input
+                    .read(cx)
+                    .text()
+                    .to_string();
+                let jump_passphrase = self.jump_passphrase_input.read(cx).text().to_string();
                 Some(JumpServerConfig {
                     host: jump_host,
                     port: jump_port,
                     username: jump_username,
-                    auth_method: SshAuthMethod::Password {
-                        password: jump_password,
-                    },
+                    auth_method: build_jump_auth_method(
+                        self.jump_auth_method,
+                        jump_password,
+                        jump_key_path,
+                        jump_private_key,
+                        jump_passphrase,
+                    ),
                 })
             } else {
                 None
@@ -675,6 +845,14 @@ impl SshFormWindow {
                 passphrase: passphrase.clone(),
                 certificate_path: None,
             },
+            SshAuthMethod::PrivateKeyContent {
+                private_key,
+                passphrase,
+            } => SshAuth::PrivateKeyContent {
+                private_key: private_key.clone(),
+                passphrase: passphrase.clone(),
+                certificate_path: None,
+            },
             SshAuthMethod::Agent => SshAuth::Agent,
             SshAuthMethod::AutoPublicKey => SshAuth::AutoPublicKey,
         };
@@ -688,6 +866,14 @@ impl SshFormWindow {
                     passphrase,
                 } => SshAuth::PrivateKey {
                     key_path: key_path.clone(),
+                    passphrase: passphrase.clone(),
+                    certificate_path: None,
+                },
+                SshAuthMethod::PrivateKeyContent {
+                    private_key,
+                    passphrase,
+                } => SshAuth::PrivateKeyContent {
+                    private_key: private_key.clone(),
                     passphrase: passphrase.clone(),
                     certificate_path: None,
                 },
@@ -836,7 +1022,7 @@ impl SshFormWindow {
             };
             let test_result: Result<(), String> = match spawn_result {
                 Ok(task) => Ok(task),
-                Err(e) => Err(e.to_string()),
+                Err(error) => Err(format_connection_error(&error)),
             };
 
             let _ = cx.update_window(window_handle, |_, window, cx| {
@@ -858,9 +1044,80 @@ impl SshFormWindow {
         .detach();
     }
 
+    fn on_uninstall_shell_integration(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(params) = self.build_ssh_params(cx) else {
+            self.shell_integration_uninstall_result =
+                Some(Err(t!("SSH.validation_error").to_string()));
+            cx.notify();
+            return;
+        };
+
+        self.is_uninstalling_shell_integration = true;
+        self.shell_integration_uninstall_result = None;
+        cx.notify();
+
+        let signature = build_connection_test_signature(&params);
+        let mut config = self.build_ssh_connect_config(&params);
+        let jump_mfa_capture = CapturedMfaRequest::default();
+        let jump_mfa_responses = self.collect_jump_mfa_responses(cx, &signature);
+        if let Some(jump_server) = &config.jump_server {
+            let jump_password = match &jump_server.auth {
+                SshAuth::Password(password) => Some(password.clone()),
+                _ => None,
+            };
+            config.keyboard_interactive_responder = Some(Arc::new(JumpServerMfaResponder::new(
+                jump_mfa_responses,
+                jump_password,
+                jump_mfa_capture.clone(),
+            )));
+        }
+        let window_handle = window.window_handle();
+
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let spawn_result = Tokio::spawn_result(cx, async move {
+                let session_manager = Arc::new(SshSessionManager::new(config));
+                SshBackend::uninstall_shell_integration(session_manager).await
+            })
+            .await;
+
+            let jump_mfa_request = match &spawn_result {
+                Err(error) if is_jump_mfa_required_error(error.as_ref()) => jump_mfa_capture.take(),
+                _ => None,
+            };
+            let uninstall_result = spawn_result.map_err(|error| error.to_string());
+
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    this.is_uninstalling_shell_integration = false;
+                    if let Some(request) = jump_mfa_request {
+                        this.apply_jump_mfa_request(request, signature, window, cx);
+                        this.shell_integration_uninstall_result =
+                            Some(Err(t!("SSH.jump_mfa_required").to_string()));
+                    } else {
+                        this.shell_integration_uninstall_result = Some(uninstall_result);
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
     fn on_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if validate_save_state(self.is_testing).is_err() {
-            self.test_result = Some(Err(t!("SSH.save_while_testing").to_string()));
+        self.save_action = SaveAction::Close;
+        self.save(window, cx);
+    }
+
+    fn on_save_and_continue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_action = SaveAction::Continue;
+        self.save(window, cx);
+    }
+
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(reason) =
+            validate_save_state(self.is_testing, self.is_uninstalling_shell_integration)
+        {
+            self.test_result = Some(Err(save_block_message(reason)));
             cx.notify();
             return;
         }
@@ -882,10 +1139,21 @@ impl SshFormWindow {
         let workspace_id = self.get_workspace_id(cx);
         let mut conn = StoredConnection::new_ssh(name, params, workspace_id);
         conn.sync_enabled = self.sync_enabled; // 设置同步状态
-        conn.team_id = self.get_team_id(cx);
-        if !self.is_editing {
-            conn.owner_id = GlobalCloudUser::get_user(cx).map(|u| u.id);
-        }
+        let assignment = match resolve_team_assignment(
+            self.get_team_id(cx),
+            self.is_editing,
+            self.editing_owner_id.clone(),
+            cx,
+        ) {
+            Ok(assignment) => assignment,
+            Err(error) => {
+                self.test_result = Some(Err(error.to_string()));
+                cx.notify();
+                return;
+            }
+        };
+        conn.team_id = assignment.team_id;
+        conn.owner_id = assignment.owner_id;
         if self.is_editing {
             conn.id = self.editing_id;
             conn.cloud_id = self.editing_cloud_id.clone();
@@ -922,16 +1190,19 @@ impl SshFormWindow {
                 if let Some(notifier) = get_notifier(cx) {
                     let event = if is_editing {
                         ConnectionDataEvent::ConnectionUpdated {
-                            connection: saved_conn,
+                            connection: saved_conn.clone(),
                         }
                     } else {
                         ConnectionDataEvent::ConnectionCreated {
-                            connection: saved_conn,
+                            connection: saved_conn.clone(),
                         }
                     };
                     notifier.update(cx, |_, cx| {
                         cx.emit(event);
                     });
+                }
+                if let Some(callback) = self.on_saved.as_ref() {
+                    callback(saved_conn, post_save_action(self.save_action), window, cx);
                 }
                 window.remove_window();
             }
@@ -977,6 +1248,7 @@ impl SshFormWindow {
                     &t!("SSH.auth_method"),
                     h_flex()
                         .gap_4()
+                        .flex_wrap()
                         .child(
                             Radio::new("password")
                                 .label(t!("SSH.password").to_string())
@@ -992,6 +1264,15 @@ impl SshFormWindow {
                                 .checked(auth_method == AuthMethodSelection::PrivateKey)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.auth_method = AuthMethodSelection::PrivateKey;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Radio::new("private-key-content")
+                                .label(t!("SSH.private_key_content").to_string())
+                                .checked(auth_method == AuthMethodSelection::PrivateKeyContent)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.auth_method = AuthMethodSelection::PrivateKeyContent;
                                     cx.notify();
                                 })),
                         )
@@ -1030,6 +1311,27 @@ impl SshFormWindow {
                     Input::new(&self.passphrase_input).mask_toggle(),
                 ))
             })
+            .when(
+                auth_method == AuthMethodSelection::PrivateKeyContent,
+                |this| {
+                    this.child(self.render_form_row(
+                        &t!("SSH.private_key_content"),
+                        Input::new(&self.private_key_content_input),
+                    ))
+                    .child(self.render_form_row(
+                        &t!("SSH.passphrase"),
+                        Input::new(&self.passphrase_input).mask_toggle(),
+                    ))
+                    .child(
+                        h_flex().justify_center().child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(t!("SSH.private_key_content_sync_hint").to_string()),
+                        ),
+                    )
+                },
+            )
             .when(auth_method == AuthMethodSelection::AutoPublicKey, |this| {
                 this.child(
                     h_flex().justify_center().child(
@@ -1044,10 +1346,23 @@ impl SshFormWindow {
                 &t!("SSH.workspace"),
                 Select::new(&self.workspace_select).w_full(),
             ))
-            .child(self.render_form_row(
-                &t!("TeamSync.team_label"),
-                Select::new(&self.team_select).w_full(),
-            ))
+            .child(
+                self.render_form_row(
+                    &team_label(),
+                    h_flex()
+                        .gap_2()
+                        .child(Select::new(&self.team_select).w_full())
+                        .child(
+                            Button::new("sync-ssh-teams")
+                                .icon(IconName::Refresh)
+                                .ghost()
+                                .tooltip(refresh_teams_tooltip())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.request_team_sync(window, cx);
+                                })),
+                        ),
+                ),
+            )
             .child(
                 self.render_form_row(
                     &t!("ConnectionForm.cloud_sync"),
@@ -1104,11 +1419,44 @@ impl SshFormWindow {
                         ),
                 ),
             )
+            .child(
+                self.render_form_row(
+                    &t!("SSH.remote_shell_integration"),
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex().gap_2().child(
+                                Button::new("uninstall-shell-integration")
+                                    .icon(IconName::Remove)
+                                    .danger()
+                                    .small()
+                                    .label(if self.is_uninstalling_shell_integration {
+                                        t!("SSH.uninstalling_shell_integration").to_string()
+                                    } else {
+                                        t!("SSH.uninstall_shell_integration").to_string()
+                                    })
+                                    .disabled(
+                                        self.is_testing || self.is_uninstalling_shell_integration,
+                                    )
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.on_uninstall_shell_integration(window, cx);
+                                    })),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(t!("SSH.uninstall_shell_integration_desc").to_string()),
+                        ),
+                ),
+            )
     }
 
     /// 渲染跳板机标签页
     fn render_jump_server_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let enable_jump = self.enable_jump_server;
+        let jump_auth_method = self.jump_auth_method;
 
         v_flex()
             .gap_2()
@@ -1137,10 +1485,115 @@ impl SshFormWindow {
                     &t!("SSH.jump_username"),
                     Input::new(&self.jump_username_input),
                 ))
-                .child(self.render_form_row(
-                    &t!("SSH.jump_password"),
-                    Input::new(&self.jump_password_input).mask_toggle(),
-                ))
+                .child(
+                    self.render_form_row(
+                        &t!("SSH.jump_auth_method"),
+                        h_flex()
+                            .gap_4()
+                            .flex_wrap()
+                            .child(
+                                Radio::new("jump-password")
+                                    .label(t!("SSH.password").to_string())
+                                    .checked(jump_auth_method == AuthMethodSelection::Password)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.jump_auth_method = AuthMethodSelection::Password;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Radio::new("jump-private-key")
+                                    .label(t!("SSH.private_key").to_string())
+                                    .checked(jump_auth_method == AuthMethodSelection::PrivateKey)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.jump_auth_method = AuthMethodSelection::PrivateKey;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Radio::new("jump-private-key-content")
+                                    .label(t!("SSH.private_key_content").to_string())
+                                    .checked(
+                                        jump_auth_method == AuthMethodSelection::PrivateKeyContent,
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.jump_auth_method =
+                                            AuthMethodSelection::PrivateKeyContent;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Radio::new("jump-agent")
+                                    .label(t!("SSH.agent").to_string())
+                                    .checked(jump_auth_method == AuthMethodSelection::Agent)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.jump_auth_method = AuthMethodSelection::Agent;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Radio::new("jump-auto-publickey")
+                                    .label(t!("SSH.auto_publickey").to_string())
+                                    .checked(jump_auth_method == AuthMethodSelection::AutoPublicKey)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.jump_auth_method = AuthMethodSelection::AutoPublicKey;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+                )
+                .when(jump_auth_method == AuthMethodSelection::Password, |this| {
+                    this.child(self.render_form_row(
+                        &t!("SSH.jump_password"),
+                        Input::new(&self.jump_password_input).mask_toggle(),
+                    ))
+                })
+                .when(
+                    jump_auth_method == AuthMethodSelection::PrivateKey,
+                    |this| {
+                        this.child(self.render_form_row(
+                            &t!("SSH.jump_key_path"),
+                            Input::new(&self.jump_key_path_input),
+                        ))
+                        .child(self.render_form_row(
+                            &t!("SSH.jump_passphrase"),
+                            Input::new(&self.jump_passphrase_input).mask_toggle(),
+                        ))
+                    },
+                )
+                .when(
+                    jump_auth_method == AuthMethodSelection::PrivateKeyContent,
+                    |this| {
+                        this.child(self.render_form_row(
+                            &t!("SSH.private_key_content"),
+                            Input::new(&self.jump_private_key_content_input),
+                        ))
+                        .child(self.render_form_row(
+                            &t!("SSH.jump_passphrase"),
+                            Input::new(&self.jump_passphrase_input).mask_toggle(),
+                        ))
+                        .child(
+                            h_flex().justify_center().child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(t!("SSH.private_key_content_sync_hint").to_string()),
+                            ),
+                        )
+                    },
+                )
+                .when(
+                    jump_auth_method == AuthMethodSelection::AutoPublicKey,
+                    |this| {
+                        this.child(
+                            h_flex().justify_center().child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(t!("SSH.auto_publickey_hint").to_string()),
+                            ),
+                        )
+                    },
+                )
                 .when_some(self.jump_mfa_request.as_ref(), |this, request| {
                     this.child(
                         v_flex()
@@ -1290,6 +1743,8 @@ impl Focusable for SshFormWindow {
 impl Render for SshFormWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_testing = self.is_testing;
+        let is_uninstalling_shell_integration = self.is_uninstalling_shell_integration;
+        let is_busy = is_testing || is_uninstalling_shell_integration;
         let active_tab = self.active_tab;
 
         let test_result_element = match &self.test_result {
@@ -1297,33 +1752,42 @@ impl Render for SshFormWindow {
                 div()
                     .text_sm()
                     .text_color(cx.theme().success)
-                    .child(t!("SSH.test_success").to_string()),
+                    .child(t!("SSH.test_success").to_string())
+                    .into_any_element(),
             ),
             Some(Err(e)) => Some(
                 div()
+                    .mx_6()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(gpui::rgb(0xfee2e2))
                     .text_sm()
                     .text_color(cx.theme().danger)
-                    .child(e.clone()),
+                    .max_h(px(120.0))
+                    .overflow_y_scrollbar()
+                    .child(e.clone())
+                    .into_any_element(),
             ),
+            None => None,
+        };
+
+        let uninstall_result_element = match &self.shell_integration_uninstall_result {
+            Some(Ok(())) => Some(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().success)
+                    .child(t!("SSH.uninstall_shell_integration_success").to_string()),
+            ),
+            Some(Err(e)) => Some(div().text_sm().text_color(cx.theme().danger).child(
+                t!("SSH.uninstall_shell_integration_failed", error = e.as_str()).to_string(),
+            )),
             None => None,
         };
 
         v_flex()
             .justify_center()
             .size_full()
-            .bg(cx.theme().background)
-            .child(
-                TitleBar::new().child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .flex_1()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(self.title.clone()),
-                ),
-            )
             // TabBar
             .child(
                 div().flex().justify_center().px_3().pt_2().child(
@@ -1364,6 +1828,9 @@ impl Render for SshFormWindow {
             .when_some(test_result_element, |this, elem| {
                 this.child(h_flex().justify_center().pb_2().child(elem))
             })
+            .when_some(uninstall_result_element, |this, elem| {
+                this.child(h_flex().justify_center().pb_2().child(elem))
+            })
             // 底部按钮
             .child(
                 h_flex()
@@ -1390,17 +1857,29 @@ impl Render for SshFormWindow {
                             } else {
                                 t!("Connection.test").to_string()
                             })
-                            .disabled(is_testing)
+                            .disabled(is_busy)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.on_test(window, cx);
                             })),
                     )
+                    .when(self.on_saved.is_some(), |this| {
+                        this.child(
+                            Button::new("save-continue")
+                                .small()
+                                .outline()
+                                .label("保存并继续")
+                                .disabled(is_busy)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.on_save_and_continue(window, cx);
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("ok")
                             .small()
                             .primary()
                             .label(t!("Common.ok").to_string())
-                            .disabled(is_testing)
+                            .disabled(is_busy)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.on_save(window, cx);
                             })),
@@ -1411,8 +1890,13 @@ impl Render for SshFormWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_connection_test_signature, validate_save_state};
-    use one_core::storage::{SshAuthMethod, SshParams};
+    use super::{
+        AuthMethodSelection, build_connection_test_signature, build_jump_auth_method,
+        format_connection_error, validate_save_state,
+    };
+    use anyhow::Context as _;
+    use one_core::storage::{SshAuthMethod, SshParams, StoredConnection};
+    use std::sync::Arc;
 
     fn sample_params() -> SshParams {
         SshParams {
@@ -1432,6 +1916,38 @@ mod tests {
     }
 
     #[test]
+    fn ssh_form_prefill_does_not_enter_edit_mode() {
+        let initial_connection =
+            StoredConnection::new_ssh("imported".to_string(), sample_params(), None);
+        let config = super::SshFormWindowConfig {
+            editing_connection: None,
+            initial_connection: Some(initial_connection),
+            on_saved: None,
+            workspaces: Vec::new(),
+            teams: Vec::new(),
+        };
+
+        assert!(!config.is_editing());
+        assert!(config.initial_connection.is_some());
+    }
+
+    #[test]
+    fn ssh_form_prefill_can_enable_save_and_continue() {
+        let initial_connection =
+            StoredConnection::new_ssh("imported".to_string(), sample_params(), None);
+        let config = super::SshFormWindowConfig {
+            editing_connection: None,
+            initial_connection: Some(initial_connection),
+            on_saved: Some(Arc::new(|_, _, _, _| {})),
+            workspaces: Vec::new(),
+            teams: Vec::new(),
+        };
+
+        assert!(config.supports_save_and_continue());
+        assert!(!config.is_editing());
+    }
+
+    #[test]
     fn connection_test_signature_changes_when_auth_related_fields_change() {
         let params = sample_params();
         let original = build_connection_test_signature(&params);
@@ -1446,12 +1962,104 @@ mod tests {
     }
 
     #[test]
+    fn connection_test_signature_does_not_expose_private_key_content() {
+        let mut params = sample_params();
+        params.auth_method = SshAuthMethod::PrivateKeyContent {
+            private_key: "-----BEGIN OPENSSH PRIVATE KEY-----\nsecret\n".to_string(),
+            passphrase: Some("secret-passphrase".to_string()),
+        };
+        let signature = build_connection_test_signature(&params);
+
+        assert!(!signature.contains("OPENSSH PRIVATE KEY"));
+        assert!(!signature.contains("secret-passphrase"));
+    }
+
+    #[test]
+    fn connection_test_error_keeps_context_chain() {
+        let error = Err::<(), _>(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied",
+        ))
+        .context("SSH connection failed")
+        .unwrap_err();
+        let message = format_connection_error(&error);
+
+        assert!(message.contains("SSH connection failed"));
+        assert!(message.contains("denied"));
+    }
+
+    #[test]
     fn save_gate_allows_saving_without_successful_connection_test() {
-        assert_eq!(validate_save_state(false), Ok(()));
+        assert_eq!(validate_save_state(false, false), Ok(()));
     }
 
     #[test]
     fn save_gate_keeps_blocking_while_connection_test_is_running() {
-        assert_eq!(validate_save_state(true), Err("testing"));
+        assert_eq!(validate_save_state(true, false), Err("testing"));
+    }
+
+    #[test]
+    fn save_gate_keeps_blocking_while_shell_integration_uninstall_is_running() {
+        assert_eq!(
+            validate_save_state(false, true),
+            Err("uninstalling_shell_integration")
+        );
+    }
+
+    #[test]
+    fn jump_auth_builder_supports_private_key() {
+        let auth = build_jump_auth_method(
+            AuthMethodSelection::PrivateKey,
+            "ignored".to_string(),
+            "/home/me/.ssh/bastion".to_string(),
+            "ignored-key".to_string(),
+            "secret".to_string(),
+        );
+
+        assert!(matches!(
+            auth,
+            SshAuthMethod::PrivateKey {
+                key_path,
+                passphrase: Some(passphrase),
+            } if key_path == "/home/me/.ssh/bastion" && passphrase == "secret"
+        ));
+    }
+
+    #[test]
+    fn jump_auth_builder_omits_empty_private_key_passphrase() {
+        let auth = build_jump_auth_method(
+            AuthMethodSelection::PrivateKey,
+            "ignored".to_string(),
+            "/home/me/.ssh/bastion".to_string(),
+            "ignored-key".to_string(),
+            String::new(),
+        );
+
+        assert!(matches!(
+            auth,
+            SshAuthMethod::PrivateKey {
+                key_path,
+                passphrase: None,
+            } if key_path == "/home/me/.ssh/bastion"
+        ));
+    }
+
+    #[test]
+    fn jump_auth_builder_supports_private_key_content() {
+        let auth = build_jump_auth_method(
+            AuthMethodSelection::PrivateKeyContent,
+            "ignored".to_string(),
+            "ignored-path".to_string(),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n".to_string(),
+            "secret".to_string(),
+        );
+
+        assert!(matches!(
+            auth,
+            SshAuthMethod::PrivateKeyContent {
+                private_key,
+                passphrase: Some(passphrase),
+            } if private_key.contains("OPENSSH PRIVATE KEY") && passphrase == "secret"
+        ));
     }
 }

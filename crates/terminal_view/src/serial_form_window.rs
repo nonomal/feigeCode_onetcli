@@ -1,10 +1,14 @@
+use connection_form::team::{
+    TeamSelectItem, create_team_select, refresh_team_options, refresh_teams_tooltip,
+    resolve_team_assignment, selected_team_id, team_label,
+};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, IndexPath, Sizable, TitleBar,
+    ActiveTheme, Disableable, IconName, IndexPath, Sizable,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -12,7 +16,7 @@ use gpui_component::{
     select::{Select, SelectItem, SelectState},
     v_flex,
 };
-use one_core::cloud_sync::{GlobalCloudUser, TeamOption};
+use one_core::cloud_sync::TeamOption;
 use one_core::connection_notifier::{ConnectionDataEvent, get_notifier};
 use one_core::storage::traits::Repository;
 use one_core::storage::{
@@ -50,40 +54,6 @@ impl WorkspaceSelectItem {
 
 impl SelectItem for WorkspaceSelectItem {
     type Value = Option<i64>;
-
-    fn title(&self) -> SharedString {
-        self.name.clone().into()
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.id
-    }
-}
-
-#[derive(Clone, Default, PartialEq)]
-struct TeamSelectItem {
-    id: Option<String>,
-    name: String,
-}
-
-impl TeamSelectItem {
-    fn personal() -> Self {
-        Self {
-            id: None,
-            name: t!("TeamSync.personal").to_string(),
-        }
-    }
-
-    fn from_team(team: &TeamOption) -> Self {
-        Self {
-            id: Some(team.id.clone()),
-            name: team.name.clone(),
-        }
-    }
-}
-
-impl SelectItem for TeamSelectItem {
-    type Value = Option<String>;
 
     fn title(&self) -> SharedString {
         self.name.clone().into()
@@ -200,11 +170,11 @@ impl SelectItem for PortItem {
 
 pub struct SerialFormWindow {
     focus_handle: FocusHandle,
-    title: SharedString,
     is_editing: bool,
     editing_id: Option<i64>,
     editing_cloud_id: Option<String>,
     editing_last_synced_at: Option<i64>,
+    editing_owner_id: Option<String>,
 
     // 基本信息
     name_input: Entity<InputState>,
@@ -254,13 +224,10 @@ impl SerialFormWindow {
             .editing_connection
             .as_ref()
             .and_then(|c| c.last_synced_at);
-
-        let title: SharedString = if is_editing {
-            t!("Serial.edit").to_string()
-        } else {
-            t!("Serial.new").to_string()
-        }
-        .into();
+        let editing_owner_id = config
+            .editing_connection
+            .as_ref()
+            .and_then(|c| c.owner_id.clone());
 
         let name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t!("Serial.name_placeholder")));
@@ -353,11 +320,7 @@ impl SerialFormWindow {
         let workspace_select =
             cx.new(|cx| SelectState::new(workspace_items, Some(Default::default()), window, cx));
 
-        // 团队选择
-        let mut team_items = vec![TeamSelectItem::personal()];
-        team_items.extend(config.teams.iter().map(TeamSelectItem::from_team));
-        let team_select =
-            cx.new(|cx| SelectState::new(team_items, Some(Default::default()), window, cx));
+        let team_select = create_team_select(&config.teams, None, window, cx);
 
         let mut sync_enabled = true;
         let mut workspace_id: Option<i64> = None;
@@ -412,11 +375,11 @@ impl SerialFormWindow {
 
         Self {
             focus_handle: cx.focus_handle(),
-            title,
             is_editing,
             editing_id,
             editing_cloud_id,
             editing_last_synced_at,
+            editing_owner_id,
             name_input,
             port_name_input,
             port_select,
@@ -443,11 +406,11 @@ impl SerialFormWindow {
     }
 
     fn get_team_id(&self, cx: &App) -> Option<String> {
-        self.team_select
-            .read(cx)
-            .selected_value()
-            .cloned()
-            .flatten()
+        selected_team_id(&self.team_select, cx)
+    }
+
+    fn request_team_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        refresh_team_options(&self.team_select, window, cx);
     }
 
     fn get_port_name(&self, cx: &App) -> String {
@@ -589,10 +552,21 @@ impl SerialFormWindow {
         let workspace_id = self.get_workspace_id(cx);
         let mut conn = StoredConnection::new_serial(name, params, workspace_id);
         conn.sync_enabled = self.sync_enabled;
-        conn.team_id = self.get_team_id(cx);
-        if !self.is_editing {
-            conn.owner_id = GlobalCloudUser::get_user(cx).map(|u| u.id);
-        }
+        let assignment = match resolve_team_assignment(
+            self.get_team_id(cx),
+            self.is_editing,
+            self.editing_owner_id.clone(),
+            cx,
+        ) {
+            Ok(assignment) => assignment,
+            Err(error) => {
+                self.test_result = Some(Err(error.to_string()));
+                cx.notify();
+                return;
+            }
+        };
+        conn.team_id = assignment.team_id;
+        conn.owner_id = assignment.owner_id;
         if self.is_editing {
             conn.id = self.editing_id;
             conn.cloud_id = self.editing_cloud_id.clone();
@@ -721,19 +695,6 @@ impl Render for SerialFormWindow {
         v_flex()
             .justify_center()
             .size_full()
-            .bg(cx.theme().background)
-            .child(
-                TitleBar::new().child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .flex_1()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(self.title.clone()),
-                ),
-            )
             // 表单内容
             .child(
                 div()
@@ -796,10 +757,23 @@ impl Render for SerialFormWindow {
                                 &t!("Serial.workspace"),
                                 Select::new(&self.workspace_select).w_full(),
                             ))
-                            .child(self.render_form_row(
-                                &t!("TeamSync.team_label"),
-                                Select::new(&self.team_select).w_full(),
-                            ))
+                            .child(
+                                self.render_form_row(
+                                    &team_label(),
+                                    h_flex()
+                                        .gap_2()
+                                        .child(Select::new(&self.team_select).w_full())
+                                        .child(
+                                            Button::new("sync-serial-teams")
+                                                .icon(IconName::Refresh)
+                                                .ghost()
+                                                .tooltip(refresh_teams_tooltip())
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.request_team_sync(window, cx);
+                                                })),
+                                        ),
+                                ),
+                            )
                             .child(
                                 self.render_form_row(
                                     &t!("ConnectionForm.cloud_sync"),

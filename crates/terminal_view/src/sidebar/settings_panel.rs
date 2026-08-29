@@ -10,15 +10,17 @@ use gpui::{
     StatefulInteractiveElement, Styled, Subscription, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme, Colorize, Icon, IconName, Sizable, Size, WindowExt,
+    Colorize, Icon, IconName, Sizable, Size, WindowExt,
     button::{Button, ButtonVariants},
     color_picker::{ColorPicker, ColorPickerState},
     dialog::DialogButtonProps,
     h_flex,
-    input::{Input, InputEvent, InputState, NumberInput, NumberInputEvent, StepAction},
+    input::{
+        Input, InputEvent, InputState, LocalInputStyle, NumberInput, NumberInputEvent, StepAction,
+    },
     notification::Notification,
     scroll::ScrollableElement,
-    select::{Select, SelectEvent, SelectState},
+    select::{Select, SelectEvent, SelectItem, SelectState},
     switch::Switch,
     try_parse_color, v_flex,
 };
@@ -27,8 +29,76 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     TerminalHighlightRule,
-    theme::{MAX_FONT_SIZE, MIN_FONT_SIZE, TerminalTheme},
+    theme::{
+        MAX_FONT_SIZE, MIN_FONT_SIZE, TerminalColors, TerminalTheme,
+        is_supported_terminal_primary_font,
+    },
 };
+use one_core::settings::{AppSettings, CustomFont, is_installed_font_family};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalFontOption {
+    value: SharedString,
+    label: SharedString,
+}
+
+impl TerminalFontOption {
+    fn new(font_family: &str, installed_font_names: &[String]) -> Self {
+        let label = if is_installed_font_family(font_family, installed_font_names) {
+            SharedString::from(font_family)
+        } else {
+            format!("{} (未安装)", font_family).into()
+        };
+
+        Self {
+            value: font_family.into(),
+            label,
+        }
+    }
+}
+
+impl SelectItem for TerminalFontOption {
+    type Value = SharedString;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.value
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        self.value.to_lowercase().contains(&query.to_lowercase())
+    }
+}
+
+fn terminal_font_options(
+    custom_fonts: &[CustomFont],
+    installed_font_names: &[String],
+) -> Vec<TerminalFontOption> {
+    let mut fonts = TerminalTheme::available_monospace_fonts()
+        .into_iter()
+        .map(|font| TerminalFontOption::new(font, installed_font_names))
+        .collect::<Vec<_>>();
+
+    for family in custom_fonts
+        .iter()
+        .flat_map(|font| font.monospace_families.iter())
+    {
+        let family = family.trim();
+        if !is_supported_terminal_primary_font(family)
+            || fonts
+                .iter()
+                .any(|existing| existing.value.as_ref() == family)
+        {
+            continue;
+        }
+        fonts.push(TerminalFontOption::new(family, installed_font_names));
+    }
+
+    fonts
+}
 
 /// 设置面板事件
 #[derive(Clone, Debug)]
@@ -59,8 +129,14 @@ pub enum SettingsPanelEvent {
     AutocompleteChanged(bool),
     /// 中键粘贴开关
     MiddleClickPasteChanged(bool),
+    /// 右键快速粘贴开关
+    RightClickPasteChanged(bool),
+    /// SSH 粘贴图片上传开关
+    PasteImageUploadChanged(bool),
     /// vim/TUI 滚轮转方向键开关
     VimScrollToArrowKeysChanged(bool),
+    /// SSH 多窗口同步输入开关
+    BroadcastInputChanged(bool),
     /// 路径同步开关变更
     SyncPathChanged(bool),
     /// 自定义高亮规则变更
@@ -74,7 +150,7 @@ pub struct SettingsPanel {
     /// 字体大小输入框状态
     font_size_input_state: Entity<InputState>,
     /// 字体选择状态
-    font_select_state: Entity<SelectState<Vec<SharedString>>>,
+    font_select_state: Entity<SelectState<Vec<TerminalFontOption>>>,
     /// 当前主题
     current_theme: TerminalTheme,
     /// 当前终端字体大小
@@ -95,8 +171,14 @@ pub struct SettingsPanel {
     autocomplete_enabled: bool,
     /// 中键粘贴
     middle_click_paste: bool,
+    /// 右键快速粘贴
+    right_click_paste: bool,
+    /// SSH 粘贴图片上传
+    paste_image_upload: bool,
     /// vim/TUI 滚轮转方向键
     vim_scroll_to_arrow_keys: bool,
+    /// SSH 多窗口同步输入
+    broadcast_input: bool,
     /// 路径与终端同步开关
     sync_path: bool,
     /// 全局自定义高亮规则
@@ -118,8 +200,11 @@ impl SettingsPanel {
         auto_copy: bool,
         autocomplete_enabled: bool,
         middle_click_paste: bool,
+        right_click_paste: bool,
+        paste_image_upload: bool,
         sync_path: bool,
         vim_scroll_to_arrow_keys: bool,
+        broadcast_input: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -134,16 +219,17 @@ impl SettingsPanel {
         });
 
         // 字体选择列表
-        let fonts: Vec<SharedString> = TerminalTheme::available_monospace_fonts()
-            .into_iter()
-            .map(|f| SharedString::from(f))
-            .collect();
+        let installed_font_names = cx.text_system().all_font_names();
+        let fonts = terminal_font_options(
+            AppSettings::global(cx).custom_fonts.as_slice(),
+            &installed_font_names,
+        );
 
         // 找到当前字体的索引
         let current_font = initial_font_family.to_string();
         let selected_index = fonts
             .iter()
-            .position(|f| f.as_ref() == current_font)
+            .position(|f| f.value.as_ref() == current_font)
             .map(|i| gpui_component::IndexPath::default().row(i));
 
         let font_select_state =
@@ -218,10 +304,12 @@ impl SettingsPanel {
         subscriptions.push(cx.subscribe_in(
             &font_select_state,
             window,
-            move |this, _state, event: &SelectEvent<Vec<SharedString>>, _window, cx| {
-                if let SelectEvent::Confirm(Some(font)) = event {
-                    this.font_family = font.clone();
-                    cx.emit(SettingsPanelEvent::FontFamilyChanged(font.to_string()));
+            move |this, _state, event: &SelectEvent<Vec<TerminalFontOption>>, _window, cx| {
+                if let SelectEvent::Confirm(Some(font_family)) = event {
+                    this.font_family = font_family.clone();
+                    cx.emit(SettingsPanelEvent::FontFamilyChanged(
+                        font_family.to_string(),
+                    ));
                 }
             },
         ));
@@ -240,6 +328,9 @@ impl SettingsPanel {
             auto_copy,
             autocomplete_enabled,
             middle_click_paste,
+            right_click_paste,
+            paste_image_upload,
+            broadcast_input,
             sync_path,
             vim_scroll_to_arrow_keys,
             custom_highlights: Vec::new(),
@@ -270,6 +361,25 @@ impl SettingsPanel {
         cx.notify();
     }
 
+    pub fn set_font_family(
+        &mut self,
+        font_family: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.font_family = font_family.clone();
+        let installed_font_names = cx.text_system().all_font_names();
+        let fonts = terminal_font_options(
+            AppSettings::global(cx).custom_fonts.as_slice(),
+            &installed_font_names,
+        );
+        self.font_select_state.update(cx, |state, cx| {
+            state.set_items(fonts, window, cx);
+            state.set_selected_value(&font_family, window, cx);
+        });
+        cx.notify();
+    }
+
     pub fn set_auto_copy(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.auto_copy = enabled;
         cx.notify();
@@ -285,8 +395,23 @@ impl SettingsPanel {
         cx.notify();
     }
 
+    pub fn set_right_click_paste(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.right_click_paste = enabled;
+        cx.notify();
+    }
+
+    pub fn set_paste_image_upload(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.paste_image_upload = enabled;
+        cx.notify();
+    }
+
     pub fn set_vim_scroll_to_arrow_keys(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.vim_scroll_to_arrow_keys = enabled;
+        cx.notify();
+    }
+
+    pub fn set_broadcast_input(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.broadcast_input = enabled;
         cx.notify();
     }
 
@@ -602,53 +727,25 @@ impl SettingsPanel {
         cx.notify();
     }
 
-    /// 渲染头部
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
-        let muted_bg = cx.theme().muted;
-        let fg = cx.theme().foreground;
+    fn colors(&self) -> TerminalColors {
+        self.current_theme.colors()
+    }
 
-        h_flex()
-            .flex_shrink_0()
-            .w_full()
-            .h(px(40.0))
-            .px_3()
-            .items_center()
-            .justify_between()
-            .border_b_1()
-            .border_color(border)
-            .bg(muted_bg)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Icon::new(IconName::Settings)
-                            .with_size(Size::Small)
-                            .text_color(fg),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(fg)
-                            .child(t!("Settings.title")),
-                    ),
-            )
-            .child(
-                Button::new("close-settings-panel")
-                    .icon(IconName::Close)
-                    .ghost()
-                    .xsmall()
-                    .on_click(cx.listener(|_this, _, _, cx| {
-                        cx.emit(SettingsPanelEvent::Close);
-                    })),
-            )
+    fn local_input_style(&self) -> LocalInputStyle {
+        let colors = self.colors();
+        LocalInputStyle {
+            background: colors.muted,
+            foreground: colors.foreground,
+            muted_foreground: colors.muted_foreground,
+            border: colors.border,
+        }
     }
 
     /// 渲染搜索区域
     fn render_search_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted_fg = cx.theme().muted_foreground;
+        let colors = self.colors();
+        let muted_fg = colors.muted_foreground;
+        let input_style = self.local_input_style();
 
         v_flex().gap_3().p_3().child(
             v_flex()
@@ -663,7 +760,13 @@ impl SettingsPanel {
                 .child(
                     h_flex()
                         .gap_2()
-                        .child(Input::new(&self.search_input_state).small().w_full())
+                        .child(
+                            Input::new(&self.search_input_state)
+                                .small()
+                                .w_full()
+                                .local_style(input_style)
+                                .caret_color(colors.foreground),
+                        )
                         .child(
                             Button::new("search-prev")
                                 .icon(IconName::ChevronUp)
@@ -697,10 +800,11 @@ impl SettingsPanel {
         let current_theme_name = self.current_theme.name;
         let is_current = current_theme_name == theme.name;
         let theme_for_click = theme.clone();
-        let accent = cx.theme().accent;
-        let accent_fg = cx.theme().accent_foreground;
-        let muted = cx.theme().muted;
-        let border = cx.theme().border;
+        let colors = self.colors();
+        let accent = colors.accent;
+        let accent_fg = colors.accent_foreground;
+        let muted = colors.muted;
+        let border = colors.border;
         let theme_i18n_key = format!("Theme.{}", theme.name);
         let theme_display_name = t!(&theme_i18n_key).to_string();
 
@@ -754,10 +858,15 @@ impl SettingsPanel {
     }
 
     /// 渲染字体设置区域
-    fn render_font_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
-        let fg = cx.theme().foreground;
-        let muted_fg = cx.theme().muted_foreground;
+    fn render_font_section(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
+        let border = colors.border;
+        let fg = colors.foreground;
+        let muted = colors.muted;
+        let muted_fg = colors.muted_foreground;
+        let accent = colors.accent;
+        let accent_fg = colors.accent_foreground;
+        let input_style = self.local_input_style();
 
         v_flex()
             .gap_3()
@@ -778,6 +887,7 @@ impl SettingsPanel {
                     .child(
                         NumberInput::new(&self.font_size_input_state)
                             .small()
+                            .local_style(input_style)
                             .suffix(div().text_xs().text_color(muted_fg).child("px")),
                     ),
             )
@@ -795,6 +905,8 @@ impl SettingsPanel {
                     .child(
                         Select::new(&self.font_select_state)
                             .small()
+                            .local_style(input_style)
+                            .local_menu_item_style(fg, muted, accent, accent_fg)
                             .text_color(fg)
                             .placeholder(t!("Settings.font_family_placeholder")),
                     ),
@@ -803,8 +915,9 @@ impl SettingsPanel {
 
     /// 渲染光标设置区域
     fn render_cursor_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
-        let muted_fg = cx.theme().muted_foreground;
+        let colors = self.colors();
+        let border = colors.border;
+        let muted_fg = colors.muted_foreground;
         let cursor_blink = self.cursor_blink;
 
         v_flex()
@@ -841,14 +954,17 @@ impl SettingsPanel {
     }
 
     fn render_safety_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
-        let muted_fg = cx.theme().muted_foreground;
+        let colors = self.colors();
+        let border = colors.border;
+        let muted_fg = colors.muted_foreground;
 
         let confirm_multiline = self.confirm_multiline_paste;
         let confirm_high_risk = self.confirm_high_risk_command;
         let auto_copy = self.auto_copy;
         let autocomplete_enabled = self.autocomplete_enabled;
         let middle_click_paste = self.middle_click_paste;
+        let right_click_paste = self.right_click_paste;
+        let paste_image_upload = self.paste_image_upload;
         let vim_scroll_to_arrow_keys = self.vim_scroll_to_arrow_keys;
 
         v_flex()
@@ -882,6 +998,40 @@ impl SettingsPanel {
                                     .on_click(cx.listener(|this, checked: &bool, _window, cx| {
                                         this.confirm_multiline_paste = *checked;
                                         cx.emit(SettingsPanelEvent::ConfirmMultilinePasteChanged(
+                                            *checked,
+                                        ));
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_sm().child(t!("Settings.right_click_paste")))
+                            .child(
+                                Switch::new("right-click-paste-switch")
+                                    .checked(right_click_paste)
+                                    .small()
+                                    .on_click(cx.listener(|this, checked: &bool, _window, cx| {
+                                        this.right_click_paste = *checked;
+                                        cx.emit(SettingsPanelEvent::RightClickPasteChanged(
+                                            *checked,
+                                        ));
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_sm().child(t!("Settings.paste_image_upload")))
+                            .child(
+                                Switch::new("paste-image-upload-switch")
+                                    .checked(paste_image_upload)
+                                    .small()
+                                    .on_click(cx.listener(|this, checked: &bool, _window, cx| {
+                                        this.paste_image_upload = *checked;
+                                        cx.emit(SettingsPanelEvent::PasteImageUploadChanged(
                                             *checked,
                                         ));
                                     })),
@@ -970,21 +1120,67 @@ impl SettingsPanel {
                                     .small()
                                     .on_click(cx.listener(|this, checked: &bool, _window, cx| {
                                         this.vim_scroll_to_arrow_keys = *checked;
-                                        cx.emit(
-                                            SettingsPanelEvent::VimScrollToArrowKeysChanged(
-                                                *checked,
-                                            ),
-                                        );
+                                        cx.emit(SettingsPanelEvent::VimScrollToArrowKeysChanged(
+                                            *checked,
+                                        ));
                                     })),
                             ),
                     ),
             )
     }
 
+    fn render_ssh_session_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
+        let border = colors.border;
+        let muted_fg = colors.muted_foreground;
+        let broadcast_input = self.broadcast_input;
+
+        v_flex()
+            .gap_3()
+            .p_3()
+            .border_t_1()
+            .border_color(border)
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(muted_fg)
+                            .child(t!("Settings.ssh_session").to_uppercase()),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_sm().child(t!("Settings.broadcast_input")))
+                            .child(
+                                Switch::new("broadcast-input-switch")
+                                    .checked(broadcast_input)
+                                    .small()
+                                    .on_click(cx.listener(|this, checked: &bool, _window, cx| {
+                                        this.broadcast_input = *checked;
+                                        cx.emit(SettingsPanelEvent::BroadcastInputChanged(
+                                            *checked,
+                                        ));
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted_fg)
+                            .child(t!("Settings.broadcast_input_help")),
+                    ),
+            )
+    }
+
     /// 渲染文件管理器设置区域（仅 SSH 终端有文件管理器时显示）
     fn render_file_manager_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
-        let muted_fg = cx.theme().muted_foreground;
+        let colors = self.colors();
+        let border = colors.border;
+        let muted_fg = colors.muted_foreground;
         let sync_path = self.sync_path;
 
         v_flex()
@@ -1036,9 +1232,10 @@ impl SettingsPanel {
         rule: &TerminalHighlightRule,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let border = cx.theme().border;
-        let muted = cx.theme().muted;
-        let muted_fg = cx.theme().muted_foreground;
+        let colors = self.colors();
+        let border = colors.border;
+        let muted = colors.muted;
+        let muted_fg = colors.muted_foreground;
         let enabled = rule.enabled;
         let pattern = rule.pattern.clone();
         let note = if rule.note.trim().is_empty() {
@@ -1188,9 +1385,10 @@ impl SettingsPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let border = cx.theme().border;
-        let muted = cx.theme().muted;
-        let muted_fg = cx.theme().muted_foreground;
+        let colors = self.colors();
+        let border = colors.border;
+        let muted = colors.muted;
+        let muted_fg = colors.muted_foreground;
         let rows: Vec<AnyElement> = self
             .custom_highlights
             .iter()
@@ -1251,9 +1449,10 @@ impl SettingsPanel {
 
     /// 渲染主题选择区域
     fn render_theme_section(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().border;
-        let muted = cx.theme().muted;
-        let muted_fg = cx.theme().muted_foreground;
+        let colors = self.colors();
+        let border = colors.border;
+        let muted = colors.muted;
+        let muted_fg = colors.muted_foreground;
 
         // 预先收集所有主题项
         let theme_items: Vec<AnyElement> = TerminalTheme::all()
@@ -1321,8 +1520,9 @@ fn validate_rule_for_save(rule: &TerminalHighlightRule) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_optional_hex_color, serialize_optional_color};
+    use super::{parse_optional_hex_color, serialize_optional_color, terminal_font_options};
     use gpui::Hsla;
+    use one_core::settings::CustomFont;
 
     #[test]
     fn parse_optional_hex_color_returns_none_for_invalid_input() {
@@ -1344,6 +1544,100 @@ mod tests {
     #[test]
     fn serialize_optional_color_returns_none_when_empty() {
         assert_eq!(serialize_optional_color(None::<Hsla>), None);
+    }
+
+    #[test]
+    fn terminal_font_options_include_only_custom_monospace_families() {
+        let installed = vec!["Custom Mono".to_string()];
+        let fonts = terminal_font_options(
+            &[
+                CustomFont {
+                    path: "/tmp/NotoSansSC-VF.ttf".to_string(),
+                    families: vec!["Noto Sans SC".to_string()],
+                    monospace_families: Vec::new(),
+                },
+                CustomFont {
+                    path: "/tmp/CustomMono.ttf".to_string(),
+                    families: vec!["Custom Mono".to_string()],
+                    monospace_families: vec!["Custom Mono".to_string()],
+                },
+            ],
+            &installed,
+        );
+        let values = fonts
+            .into_iter()
+            .map(|font| font.value.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(values.iter().any(|font| font == "Custom Mono"));
+        assert!(!values.iter().any(|font| font == "Noto Sans SC"));
+    }
+
+    #[test]
+    fn terminal_font_options_exclude_builtin_cjk_ui_fonts() {
+        let fonts = terminal_font_options(&[], &[]);
+        let values = fonts
+            .into_iter()
+            .map(|font| font.value.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(!values.iter().any(|font| font == "Noto Sans Mono CJK SC"));
+        assert!(!values.iter().any(|font| font == "Source Han Mono SC"));
+        assert!(!values.iter().any(|font| font == "Noto Sans CJK SC"));
+        assert!(!values.iter().any(|font| font == "Source Han Sans SC"));
+        assert!(!values.iter().any(|font| font == "Microsoft YaHei"));
+        assert!(!values.iter().any(|font| font == "PingFang SC"));
+        assert!(!values.iter().any(|font| font == "SimSun"));
+    }
+
+    #[test]
+    fn terminal_font_options_exclude_custom_fallback_only_fonts() {
+        let installed = vec!["Custom Mono".to_string()];
+        let fonts = terminal_font_options(
+            &[CustomFont {
+                path: "/tmp/CjkFonts.ttc".to_string(),
+                families: vec!["PingFang SC".to_string()],
+                monospace_families: vec![
+                    "Noto Sans Mono CJK SC".to_string(),
+                    "PingFang SC".to_string(),
+                    "Custom Mono".to_string(),
+                ],
+            }],
+            &installed,
+        );
+        let values = fonts
+            .into_iter()
+            .map(|font| font.value.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(values.iter().any(|font| font == "Custom Mono"));
+        assert!(!values.iter().any(|font| font == "Noto Sans Mono CJK SC"));
+        assert!(!values.iter().any(|font| font == "PingFang SC"));
+    }
+
+    #[test]
+    fn terminal_font_options_mark_missing_fonts_without_changing_values() {
+        let installed = vec!["Menlo".to_string()];
+        let fonts = terminal_font_options(
+            &[CustomFont {
+                path: "/tmp/CustomMono.ttf".to_string(),
+                families: vec!["Custom Mono".to_string()],
+                monospace_families: vec!["Custom Mono".to_string()],
+            }],
+            &installed,
+        );
+
+        assert!(
+            fonts
+                .iter()
+                .any(|font| { font.value.as_ref() == "Menlo" && font.label.as_ref() == "Menlo" })
+        );
+        assert!(fonts.iter().any(|font| {
+            font.value.as_ref() == "Fira Code" && font.label.as_ref() == "Fira Code (未安装)"
+        }));
+        assert!(fonts.iter().any(|font| {
+            font.value.as_ref() == "Custom Mono" && font.label.as_ref() == "Custom Mono (未安装)"
+        }));
     }
 
     #[test]
@@ -1380,12 +1674,12 @@ impl Focusable for SettingsPanel {
 impl Render for SettingsPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_file_manager = self.has_file_manager;
+        let colors = self.colors();
 
         v_flex()
             .size_full()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .child(self.render_header(cx))
+            .bg(colors.background)
+            .text_color(colors.foreground)
             .child(
                 div()
                     .id("settings-panel-scroll")
@@ -1395,10 +1689,14 @@ impl Render for SettingsPanel {
                     .child(
                         v_flex()
                             .flex_shrink_0()
+                            .pb_4()
                             .child(self.render_search_section(cx))
                             .child(self.render_font_section(cx))
                             .child(self.render_cursor_section(cx))
                             .child(self.render_safety_section(cx))
+                            .when(has_file_manager, |el| {
+                                el.child(self.render_ssh_session_section(cx))
+                            })
                             .when(has_file_manager, |el| {
                                 el.child(self.render_file_manager_section(cx))
                             })

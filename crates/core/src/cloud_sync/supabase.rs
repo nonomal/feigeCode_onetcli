@@ -638,7 +638,10 @@ impl SupabaseClient {
         body: &B,
     ) -> Result<Response<AsyncBody>, CloudApiError> {
         // 确保 token 有效
-        self.ensure_token_valid().await?;
+        if self.is_token_expiring_soon() {
+            info!("[supabase] proactive token refresh before PATCH {}", url);
+            self.ensure_token_valid().await?;
+        }
 
         let body_bytes =
             serde_json::to_vec(body).map_err(|e| CloudApiError::ParseError(e.to_string()))?;
@@ -1075,6 +1078,7 @@ impl From<TeamMemberRow> for TeamMember {
             user_id: row.user_id,
             role: match row.role.as_str() {
                 "owner" => TeamRole::Owner,
+                "admin" => TeamRole::Admin,
                 _ => TeamRole::Member,
             },
             joined_at: row
@@ -1684,7 +1688,7 @@ impl CloudApiClient for SupabaseClient {
     }
 
     // ========================================================================
-    // 团队管理
+    // 团队读取
     // ========================================================================
 
     async fn list_teams(&self) -> Result<Vec<Team>, CloudApiError> {
@@ -1706,90 +1710,6 @@ impl CloudApiClient for SupabaseClient {
         }
     }
 
-    async fn create_team(&self, team: &Team) -> Result<Team, CloudApiError> {
-        let url = self.rest_url("teams");
-        let row = TeamRow::from(team);
-        let extra_headers = vec![("Prefer", "return=representation".to_string())];
-
-        let auth_user_id = self.get_user_id();
-        info!(
-            "[create_team] team.owner_id={} auth_state.user_id={:?} match={}",
-            team.owner_id,
-            auth_user_id,
-            auth_user_id.as_deref() == Some(team.owner_id.as_str())
-        );
-
-        let (status, result) = self
-            .post_json_with_retry::<Vec<TeamRow>, _>(&url, extra_headers, &row)
-            .await?;
-
-        if status.is_success() {
-            let rows = result.map_err(|e| CloudApiError::ParseError(e))?;
-            rows.into_iter()
-                .next()
-                .map(|r| r.into())
-                .ok_or_else(|| CloudApiError::ParseError("创建团队响应为空".to_string()))
-        } else {
-            let error_body = Self::format_error_summary(&result);
-            warn!(
-                status = status.as_u16(),
-                url = %url,
-                error_body = %error_body,
-                "创建团队失败"
-            );
-            Err(CloudApiError::ServerError("创建团队失败".to_string()))
-        }
-    }
-
-    async fn update_team(&self, team: &Team) -> Result<Team, CloudApiError> {
-        let url = format!("{}?id=eq.{}", self.rest_url("teams"), team.id);
-
-        #[derive(Serialize)]
-        struct UpdateTeam {
-            name: String,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            description: Option<String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            key_verification: Option<String>,
-            key_version: i32,
-        }
-
-        let payload = UpdateTeam {
-            name: team.name.clone(),
-            description: team.description.clone(),
-            key_verification: team.key_verification.clone(),
-            key_version: team.key_version as i32,
-        };
-
-        let extra_headers = vec![("Prefer", "return=representation".to_string())];
-
-        let (status, result) = self
-            .patch_json_with_retry::<Vec<TeamRow>, _>(&url, extra_headers, &payload)
-            .await?;
-
-        if status.is_success() {
-            let rows = result.map_err(|e| CloudApiError::ParseError(e))?;
-            rows.into_iter()
-                .next()
-                .map(|r| r.into())
-                .ok_or_else(|| CloudApiError::ParseError("更新团队响应为空".to_string()))
-        } else {
-            Err(CloudApiError::ServerError("更新团队失败".to_string()))
-        }
-    }
-
-    async fn delete_team(&self, id: &str) -> Result<(), CloudApiError> {
-        let url = format!("{}?id=eq.{}", self.rest_url("teams"), id);
-
-        let status = self.delete_with_retry(&url).await?;
-
-        if status.is_success() {
-            Ok(())
-        } else {
-            Err(CloudApiError::ServerError("删除团队失败".to_string()))
-        }
-    }
-
     async fn list_team_members(&self, team_id: &str) -> Result<Vec<TeamMember>, CloudApiError> {
         let url = format!(
             "{}?team_id=eq.{}&order=joined_at.asc",
@@ -1806,98 +1726,115 @@ impl CloudApiClient for SupabaseClient {
         }
     }
 
-    async fn add_team_member(&self, member: &TeamMember) -> Result<TeamMember, CloudApiError> {
-        let url = self.rest_url("team_members");
-        let row = TeamMemberRow::from(member);
-        let extra_headers = vec![("Prefer", "return=representation".to_string())];
+    async fn initialize_team_key(&self, team: &Team) -> Result<Team, CloudApiError> {
+        let key_verification = team
+            .key_verification
+            .as_deref()
+            .ok_or_else(|| CloudApiError::ServerError("团队密钥验证数据为空".to_string()))?;
+        let url = format!(
+            "{}?id=eq.{}&key_verification=is.null",
+            self.rest_url("teams"),
+            team.id
+        );
 
+        #[derive(Serialize)]
+        struct InitializeTeamKeyPayload<'a> {
+            key_verification: &'a str,
+            key_version: i32,
+        }
+
+        let payload = InitializeTeamKeyPayload {
+            key_verification,
+            key_version: team.key_version as i32,
+        };
+        let extra_headers = vec![("Prefer", "return=representation".to_string())];
         let (status, result) = self
-            .post_json_with_retry::<Vec<TeamMemberRow>, _>(&url, extra_headers, &row)
+            .patch_json_with_retry::<Vec<TeamRow>, _>(&url, extra_headers, &payload)
             .await?;
 
         if status.is_success() {
-            let rows = result.map_err(|e| CloudApiError::ParseError(e))?;
-            rows.into_iter()
-                .next()
-                .map(|r| r.into())
-                .ok_or_else(|| CloudApiError::ParseError("添加成员响应为空".to_string()))
+            let rows = result.map_err(CloudApiError::ParseError)?;
+            rows.into_iter().next().map(Team::from).ok_or_else(|| {
+                CloudApiError::Conflict("团队密钥已初始化，请刷新团队列表后重试".to_string())
+            })
+        } else if status == StatusCode::CONFLICT || status.as_u16() == 409 {
+            Err(CloudApiError::Conflict(
+                "团队密钥初始化冲突，请刷新团队列表后重试".to_string(),
+            ))
         } else {
-            Err(CloudApiError::ServerError("添加团队成员失败".to_string()))
+            let error_body = Self::format_error_summary(&result);
+            Err(CloudApiError::ServerError(format!(
+                "团队密钥初始化失败: {}",
+                error_body
+            )))
         }
     }
 
-    async fn add_team_member_by_email(
+    async fn rotate_team_key(
         &self,
-        team_id: &str,
-        email: &str,
-    ) -> Result<TeamMember, CloudApiError> {
-        let url = self.rest_url("rpc/add_team_member_by_email");
+        team: &Team,
+        records: &[CloudSyncData],
+    ) -> Result<(), CloudApiError> {
+        let url = format!("{}/rest/v1/rpc/rotate_team_key", self.config.project_url);
 
         #[derive(Serialize)]
-        struct RpcParams<'a> {
-            p_team_id: &'a str,
-            p_email: &'a str,
+        struct RotateRecord<'a> {
+            id: &'a str,
+            version: u32,
+            encrypted_data: &'a str,
+            key_version: u32,
+            checksum: &'a str,
+            deleted_at: Option<String>,
         }
 
-        let params = RpcParams {
-            p_team_id: team_id,
-            p_email: email,
+        #[derive(Serialize)]
+        struct RotatePayload<'a> {
+            p_team_id: &'a str,
+            p_key_verification: &'a str,
+            p_key_version: u32,
+            p_records: Vec<RotateRecord<'a>>,
+        }
+
+        let key_verification = team
+            .key_verification
+            .as_deref()
+            .ok_or_else(|| CloudApiError::ServerError("团队密钥验证数据为空".to_string()))?;
+        let records = records
+            .iter()
+            .map(|record| RotateRecord {
+                id: &record.id,
+                version: record.version,
+                encrypted_data: &record.encrypted_data,
+                key_version: record.key_version,
+                checksum: &record.checksum,
+                deleted_at: record.deleted_at.and_then(|ts| {
+                    chrono::DateTime::from_timestamp_millis(ts).map(|dt| dt.to_rfc3339())
+                }),
+            })
+            .collect();
+        let payload = RotatePayload {
+            p_team_id: &team.id,
+            p_key_verification: key_verification,
+            p_key_version: team.key_version,
+            p_records: records,
         };
 
         let (status, result) = self
-            .post_json_with_retry::<serde_json::Value, _>(&url, vec![], &params)
+            .post_json_with_retry::<serde_json::Value, _>(&url, vec![], &payload)
             .await?;
 
         if status.is_success() {
-            let json = result.map_err(CloudApiError::ParseError)?;
-            Ok(TeamMember {
-                id: json
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                team_id: json
-                    .get("team_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                user_id: json
-                    .get("user_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                role: TeamRole::Member,
-                joined_at: json
-                    .get("joined_at")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.timestamp_millis())
-                    .unwrap_or(0),
-            })
-        } else {
-            let error_msg = match result {
-                Err(e) => {
-                    // 尝试解析 PostgreSQL 异常信息
-                    serde_json::from_str::<serde_json::Value>(&e)
-                        .ok()
-                        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
-                        .unwrap_or(e)
-                }
-                Ok(_) => "添加成员失败".to_string(),
-            };
-            Err(CloudApiError::ServerError(error_msg))
-        }
-    }
-
-    async fn remove_team_member(&self, member_id: &str) -> Result<(), CloudApiError> {
-        let url = format!("{}?id=eq.{}", self.rest_url("team_members"), member_id);
-
-        let status = self.delete_with_retry(&url).await?;
-
-        if status.is_success() {
             Ok(())
+        } else if status == StatusCode::CONFLICT || status.as_u16() == 409 {
+            Err(CloudApiError::Conflict(
+                "团队密钥轮换冲突，请重新同步后再试".to_string(),
+            ))
         } else {
-            Err(CloudApiError::ServerError("移除团队成员失败".to_string()))
+            let error_body = Self::format_error_summary(&result);
+            Err(CloudApiError::ServerError(format!(
+                "团队密钥轮换失败: {}",
+                error_body
+            )))
         }
     }
 
@@ -2047,10 +1984,145 @@ impl CloudApiClient for SupabaseClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
+    use std::sync::Mutex;
+
+    #[test]
+    fn team_member_row_preserves_admin_role() {
+        let row = TeamMemberRow {
+            id: Some("member-1".to_string()),
+            team_id: "team-1".to_string(),
+            user_id: "user-1".to_string(),
+            role: "admin".to_string(),
+            joined_at: Some("2026-06-22T00:00:00Z".to_string()),
+        };
+
+        let member = TeamMember::from(row);
+
+        assert_eq!(TeamRole::Admin, member.role);
+
+        let row = TeamMemberRow::from(&member);
+        assert_eq!("admin", row.role);
+    }
+
     #[test]
     fn test_url_encode() {
         assert_eq!(SupabaseClient::url_encode("hello"), "hello");
         assert_eq!(SupabaseClient::url_encode("hello world"), "hello%20world");
         assert_eq!(SupabaseClient::url_encode("a+b=c"), "a%2Bb%3Dc");
+    }
+
+    #[tokio::test]
+    async fn update_sync_data_uses_id_and_version_filter() {
+        let http = Arc::new(RecordingHttpClient::respond_json(
+            200,
+            r#"[{"id":"cloud-1","owner_id":"user-1","team_id":null,"data_type":"connection","encrypted_data":"enc","key_version":1,"checksum":"b","version":8,"updated_at":"2026-07-03T00:00:00Z","deleted_at":null}]"#,
+        ));
+        let client = SupabaseClient::new(test_config(), http.clone());
+        client.set_auth(
+            "access".to_string(),
+            "refresh".to_string(),
+            "user-1".to_string(),
+        );
+
+        let mut data = test_cloud_sync_data();
+        data.id = "cloud-1".to_string();
+        data.version = 7;
+        data.checksum = "b".to_string();
+        let updated = client
+            .update_sync_data(&data)
+            .await
+            .expect("update succeeds");
+        let url = http.last_url();
+
+        assert_eq!(8, updated.version);
+        assert!(url.contains("id=eq.cloud-1"));
+        assert!(url.contains("version=eq.7"));
+    }
+
+    #[tokio::test]
+    async fn update_sync_data_empty_patch_response_is_conflict() {
+        let http = Arc::new(RecordingHttpClient::respond_json(200, "[]"));
+        let client = SupabaseClient::new(test_config(), http);
+        client.set_auth(
+            "access".to_string(),
+            "refresh".to_string(),
+            "user-1".to_string(),
+        );
+
+        let error = client
+            .update_sync_data(&test_cloud_sync_data())
+            .await
+            .expect_err("empty response means version filter matched no rows");
+
+        assert!(matches!(error, CloudApiError::Conflict(_)));
+    }
+
+    struct RecordingHttpClient {
+        status: u16,
+        body: &'static str,
+        last_url: Mutex<Option<String>>,
+    }
+
+    impl RecordingHttpClient {
+        fn respond_json(status: u16, body: &'static str) -> Self {
+            Self {
+                status,
+                body,
+                last_url: Mutex::new(None),
+            }
+        }
+
+        fn last_url(&self) -> String {
+            self.last_url
+                .lock()
+                .expect("last_url lock")
+                .clone()
+                .expect("request captured")
+        }
+    }
+
+    impl HttpClient for RecordingHttpClient {
+        fn user_agent(&self) -> Option<&gpui::http_client::http::HeaderValue> {
+            None
+        }
+
+        fn send(
+            &self,
+            req: Request<AsyncBody>,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
+            *self.last_url.lock().expect("last_url lock") = Some(req.uri().to_string());
+            let response = Response::builder()
+                .status(self.status)
+                .body(AsyncBody::from(self.body.as_bytes().to_vec()))
+                .map_err(|error| anyhow!("build response failed: {error}"));
+            async move { response }.boxed()
+        }
+
+        fn proxy(&self) -> Option<&gpui::http_client::Url> {
+            None
+        }
+    }
+
+    fn test_config() -> SupabaseConfig {
+        SupabaseConfig {
+            project_url: "https://project.supabase.co".to_string(),
+            api_key: "anon".to_string(),
+        }
+    }
+
+    fn test_cloud_sync_data() -> CloudSyncData {
+        CloudSyncData {
+            id: "cloud-1".to_string(),
+            owner_id: "user-1".to_string(),
+            team_id: None,
+            data_type: data_type::CONNECTION.to_string(),
+            encrypted_data: "enc".to_string(),
+            key_version: 1,
+            checksum: "a".to_string(),
+            version: 7,
+            updated_at: 1_000,
+            deleted_at: None,
+        }
     }
 }

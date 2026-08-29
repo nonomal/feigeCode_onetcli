@@ -1,15 +1,17 @@
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, IntoElement, ListSizingBehavior, MouseButton,
-    MouseDownEvent, ParentElement, Render, SharedString, Styled, UniformListScrollHandle, Window,
-    div, prelude::*, px, uniform_list,
+    MouseDownEvent, ParentElement, Render, Styled, UniformListScrollHandle, Window, div,
+    prelude::*, px, uniform_list,
 };
 use gpui_component::{
     ActiveTheme, Icon, IconName, InteractiveElementExt, Sizable, Size, h_flex,
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
+    scroll::ScrollableElement,
     tooltip::Tooltip,
     v_flex,
 };
+use remote_file_editor::{external_editor_menu_label, external_editors_for_file};
 use rust_i18n::t;
 use std::collections::HashSet;
 use std::ops::Range;
@@ -71,6 +73,62 @@ fn get_file_kind(name: &str) -> String {
     "file".to_string()
 }
 
+fn display_file_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| match ch {
+            '\n' | '\r' | '\t' => ' ',
+            ch if ch.is_control() => '?',
+            ch => ch,
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionMode {
+    Replace,
+    Toggle,
+    Range,
+}
+
+fn selection_mode(shift_pressed: bool, multi_select: bool) -> SelectionMode {
+    if shift_pressed {
+        SelectionMode::Range
+    } else if multi_select {
+        SelectionMode::Toggle
+    } else {
+        SelectionMode::Replace
+    }
+}
+
+fn apply_selection_mode(
+    selected_indices: &mut HashSet<usize>,
+    anchor_index: &mut Option<usize>,
+    row_ix: usize,
+    mode: SelectionMode,
+) {
+    match mode {
+        SelectionMode::Replace => {
+            selected_indices.clear();
+            selected_indices.insert(row_ix);
+            *anchor_index = Some(row_ix);
+        }
+        SelectionMode::Toggle => {
+            if !selected_indices.remove(&row_ix) {
+                selected_indices.insert(row_ix);
+            }
+            *anchor_index = Some(row_ix);
+        }
+        SelectionMode::Range => {
+            let anchor = anchor_index.unwrap_or(row_ix);
+            let start = anchor.min(row_ix);
+            let end = anchor.max(row_ix);
+            selected_indices.clear();
+            selected_indices.extend(start..=end);
+            anchor_index.get_or_insert(row_ix);
+        }
+    }
+}
+
 pub struct FileListPanel {
     current_path: String,
     is_remote: bool,
@@ -78,6 +136,7 @@ pub struct FileListPanel {
     items: Vec<FileItem>,
     filtered_indices: Vec<usize>,
     selected_indices: HashSet<usize>,
+    selection_anchor_index: Option<usize>,
     sort_column: SortColumn,
     sort_order: SortOrder,
 
@@ -133,6 +192,7 @@ impl FileListPanel {
             items: Vec::new(),
             filtered_indices: Vec::new(),
             selected_indices: HashSet::new(),
+            selection_anchor_index: None,
             sort_column: SortColumn::Name,
             sort_order: SortOrder::Ascending,
             show_hidden: false,
@@ -148,7 +208,7 @@ impl FileListPanel {
 
     pub fn set_items(&mut self, items: Vec<FileItem>, cx: &mut Context<Self>) {
         self.items = items;
-        self.selected_indices.clear();
+        self.clear_selection();
         self.sort_items();
         self.apply_filter();
         cx.notify();
@@ -186,7 +246,7 @@ impl FileListPanel {
     fn on_search_change(&mut self, query: String, cx: &mut Context<Self>) {
         self.search_query = query;
         self.apply_filter();
-        self.selected_indices.clear();
+        self.clear_selection();
         cx.notify();
     }
 
@@ -218,7 +278,7 @@ impl FileListPanel {
     pub fn toggle_show_hidden(&mut self, cx: &mut Context<Self>) {
         self.show_hidden = !self.show_hidden;
         self.apply_filter();
-        self.selected_indices.clear();
+        self.clear_selection();
         cx.notify();
     }
 
@@ -279,19 +339,29 @@ impl FileListPanel {
         }
     }
 
-    fn toggle_selection(&mut self, row_ix: usize, multi_select: bool) {
-        if multi_select {
-            if self.selected_indices.contains(&row_ix) {
-                self.selected_indices.remove(&row_ix);
-            } else {
-                self.selected_indices.insert(row_ix);
-            }
-        } else {
-            if !self.selected_indices.contains(&row_ix) {
-                self.selected_indices.clear();
-                self.selected_indices.insert(row_ix);
-            }
+    fn clear_selection(&mut self) {
+        self.selected_indices.clear();
+        self.selection_anchor_index = None;
+    }
+
+    fn select_row(&mut self, row_ix: usize, mode: SelectionMode) {
+        apply_selection_mode(
+            &mut self.selected_indices,
+            &mut self.selection_anchor_index,
+            row_ix,
+            mode,
+        );
+    }
+
+    fn select_context_target(&mut self, filtered_ix: usize, cx: &mut Context<Self>) {
+        if self.selected_indices.contains(&filtered_ix) {
+            return;
         }
+
+        self.selected_indices.clear();
+        self.selected_indices.insert(filtered_ix);
+        self.selection_anchor_index = Some(filtered_ix);
+        cx.notify();
     }
 
     fn set_sort(&mut self, column: SortColumn, cx: &mut Context<Self>) {
@@ -306,7 +376,7 @@ impl FileListPanel {
         }
         self.sort_items();
         self.apply_filter();
-        self.selected_indices.clear();
+        self.clear_selection();
         cx.notify();
     }
 
@@ -466,12 +536,13 @@ impl FileListPanel {
 
     fn render_file_row(
         &self,
-        _ix: usize,
+        ix: usize,
         item: &FileItem,
         is_selected: bool,
         cx: &App,
     ) -> impl IntoElement {
         let name = item.name.clone();
+        let display_name = display_file_name(&name);
         let is_dir = item.is_dir;
         let size = item.size;
         let modified = item.modified;
@@ -484,6 +555,8 @@ impl FileListPanel {
             .child(
                 h_flex()
                     .w(px(250.))
+                    .min_w_0()
+                    .overflow_hidden()
                     .gap_2()
                     .items_center()
                     .child(
@@ -496,18 +569,19 @@ impl FileListPanel {
                         .color(),
                     )
                     .child({
-                        let tooltip_name = name.clone();
+                        let tooltip_name = display_name.clone();
                         v_flex()
                             .flex_1()
+                            .min_w_0()
                             .overflow_hidden()
                             .child(
                                 div()
-                                    .id(SharedString::from(name.clone()))
+                                    .id(("file-name", ix))
                                     .text_base()
                                     .overflow_hidden()
                                     .text_ellipsis()
                                     .whitespace_nowrap()
-                                    .child(name.clone())
+                                    .child(display_name.clone())
                                     .tooltip(move |window, cx| {
                                         Tooltip::new(tooltip_name.clone()).build(window, cx)
                                     }),
@@ -517,6 +591,9 @@ impl FileListPanel {
                                     div()
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
                                         .child(item.permissions.clone()),
                                 )
                             })
@@ -525,17 +602,25 @@ impl FileListPanel {
             .child(
                 div()
                     .w(px(180.))
+                    .min_w_0()
+                    .overflow_hidden()
                     .px_2()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .child(format_modified_time(modified)),
             )
             .child(
                 div()
                     .w(px(100.))
+                    .min_w_0()
+                    .overflow_hidden()
                     .px_2()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .child(if is_dir {
                         "- -".to_string()
                     } else {
@@ -545,9 +630,13 @@ impl FileListPanel {
             .child(
                 div()
                     .w(px(80.))
+                    .min_w_0()
+                    .overflow_hidden()
                     .px_2()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .child(if is_dir {
                         "folder".to_string()
                     } else {
@@ -578,26 +667,32 @@ impl FileListPanel {
     /// 根据 is_remote（远程/本地）和 is_dir（文件夹/文件）显示不同的菜单项
     fn build_file_context_menu(
         menu: PopupMenu,
+        filtered_ix: usize,
         name: &str,
         full_path: &str,
         is_dir: bool,
         is_remote: bool,
         view: &Entity<Self>,
         window: &mut Window,
-        _cx: &mut Context<PopupMenu>,
+        cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
         let name_for_rename = name.to_string();
         let path_for_rename = full_path.to_string();
         let name_for_download = name.to_string();
         let path_for_download = full_path.to_string();
         let path_for_edit = full_path.to_string();
+        let name_for_extract = name.to_string();
+        let path_for_extract = full_path.to_string();
         let name_for_permissions = name.to_string();
         let path_for_permissions = full_path.to_string();
         let path_for_terminal = full_path.to_string();
+        let path_for_favorite = full_path.to_string();
         let name_for_copy = name.to_string();
         let path_for_copy = full_path.to_string();
         let name_for_delete = name.to_string();
         let path_for_delete = full_path.to_string();
+        let path_for_upload_file = full_path.to_string();
+        let path_for_upload_folder = full_path.to_string();
 
         let view_ref = view.clone();
 
@@ -647,7 +742,8 @@ impl FileListPanel {
             menu = menu.item(
                 PopupMenuItem::new(t!("Common.download").to_string())
                     .icon(IconName::ArrowDown)
-                    .on_click(window.listener_for(&view_download, move |_this, _, _, cx| {
+                    .on_click(window.listener_for(&view_download, move |this, _, _, cx| {
+                        this.select_context_target(filtered_ix, cx);
                         cx.emit(FileListPanelEvent::Download {
                             name: name_for_download.clone(),
                             full_path: path_for_download.clone(),
@@ -666,6 +762,39 @@ impl FileListPanel {
                             });
                         })),
                 );
+
+                for editor in external_editors_for_file(name, cx) {
+                    let view_external = view_ref.clone();
+                    let path_for_external = full_path.to_string();
+                    let editor_key = editor.editor_key;
+                    menu = menu.item(
+                        PopupMenuItem::new(external_editor_menu_label(&editor.display_name))
+                            .icon(IconName::Edit)
+                            .on_click(window.listener_for(
+                                &view_external,
+                                move |_this, _, _, cx| {
+                                    cx.emit(FileListPanelEvent::EditExternal {
+                                        full_path: path_for_external.clone(),
+                                        editor_key: editor_key.clone(),
+                                    });
+                                },
+                            )),
+                    );
+                }
+            }
+
+            if !is_dir && crate::archive_kind_for_name(name).is_some() {
+                let view_extract = view_ref.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(t!("File.extract").to_string())
+                        .icon(IconName::Unarchive)
+                        .on_click(window.listener_for(&view_extract, move |_this, _, _, cx| {
+                            cx.emit(FileListPanelEvent::Extract {
+                                name: name_for_extract.clone(),
+                                full_path: path_for_extract.clone(),
+                            });
+                        })),
+                );
             }
         }
 
@@ -675,7 +804,8 @@ impl FileListPanel {
             menu = menu.item(
                 PopupMenuItem::new(t!("Common.upload").to_string())
                     .icon(IconName::Upload)
-                    .on_click(window.listener_for(&view_upload, move |_this, _, _, cx| {
+                    .on_click(window.listener_for(&view_upload, move |this, _, _, cx| {
+                        this.select_context_target(filtered_ix, cx);
                         cx.emit(FileListPanelEvent::UploadFile);
                     })),
             );
@@ -702,9 +832,19 @@ impl FileListPanel {
         if is_dir {
             let view_terminal_at = view_ref.clone();
             let view_terminal = view_ref.clone();
+            let view_favorite = view_ref.clone();
 
             menu = menu
                 .separator()
+                .item(
+                    PopupMenuItem::new(t!("FavoritePath.add_path").to_string())
+                        .icon(IconName::Star)
+                        .on_click(window.listener_for(&view_favorite, move |_this, _, _, cx| {
+                            cx.emit(FileListPanelEvent::FavoritePath {
+                                full_path: path_for_favorite.clone(),
+                            });
+                        })),
+                )
                 .item(
                     PopupMenuItem::new(t!("Terminal.open_here").to_string())
                         .icon(IconName::Terminal)
@@ -759,7 +899,8 @@ impl FileListPanel {
         menu = menu.separator().item(
             PopupMenuItem::new(t!("Common.delete").to_string())
                 .icon(IconName::Remove)
-                .on_click(window.listener_for(&view_delete, move |_this, _, _, cx| {
+                .on_click(window.listener_for(&view_delete, move |this, _, _, cx| {
+                    this.select_context_target(filtered_ix, cx);
                     cx.emit(FileListPanelEvent::Delete {
                         name: name_for_delete.clone(),
                         full_path: path_for_delete.clone(),
@@ -780,7 +921,9 @@ impl FileListPanel {
                         .on_click(window.listener_for(
                             &view_upload_file,
                             move |_this, _, _, cx| {
-                                cx.emit(FileListPanelEvent::UploadFile);
+                                cx.emit(FileListPanelEvent::UploadFileTo {
+                                    full_path: path_for_upload_file.clone(),
+                                });
                             },
                         )),
                 )
@@ -790,7 +933,9 @@ impl FileListPanel {
                         .on_click(window.listener_for(
                             &view_upload_folder,
                             move |_this, _, _, cx| {
-                                cx.emit(FileListPanelEvent::UploadFolder);
+                                cx.emit(FileListPanelEvent::UploadFolderTo {
+                                    full_path: path_for_upload_folder.clone(),
+                                });
                             },
                         )),
                 );
@@ -848,6 +993,14 @@ pub enum FileListPanelEvent {
     Edit {
         full_path: String,
     },
+    EditExternal {
+        full_path: String,
+        editor_key: String,
+    },
+    Extract {
+        name: String,
+        full_path: String,
+    },
     /// 修改权限
     ChangePermissions {
         name: String,
@@ -872,10 +1025,22 @@ pub enum FileListPanelEvent {
         name: String,
         full_path: String,
     },
+    /// 收藏远程路径
+    FavoritePath {
+        full_path: String,
+    },
     /// 上传文件
     UploadFile,
     /// 上传文件夹
     UploadFolder,
+    /// 上传文件到指定远程目录
+    UploadFileTo {
+        full_path: String,
+    },
+    /// 上传文件夹到指定远程目录
+    UploadFolderTo {
+        full_path: String,
+    },
     /// 刷新列表
     Refresh,
     /// 显示隐藏文件
@@ -1007,6 +1172,73 @@ impl Render for DraggedFileItem {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::display_file_name;
+    use std::collections::HashSet;
+
+    #[test]
+    fn display_file_name_replaces_line_breaks_and_tabs() {
+        assert_eq!(
+            "syntax error near newline",
+            display_file_name("syntax error\nnear\tnewline")
+        );
+    }
+
+    #[test]
+    fn display_file_name_replaces_ansi_control_bytes() {
+        assert_eq!("?[1mroot?[0m", display_file_name("\x1b[1mroot\x1b[0m"));
+    }
+
+    #[test]
+    fn range_selection_selects_rows_between_anchor_and_clicked_row() {
+        let mut selected_indices = HashSet::from([4usize]);
+        let mut anchor_index = Some(4usize);
+
+        super::apply_selection_mode(
+            &mut selected_indices,
+            &mut anchor_index,
+            1,
+            super::SelectionMode::Range,
+        );
+
+        assert_eq!(HashSet::from([1usize, 2, 3, 4]), selected_indices);
+        assert_eq!(Some(4), anchor_index);
+    }
+
+    #[test]
+    fn range_selection_without_anchor_selects_clicked_row() {
+        let mut selected_indices = HashSet::new();
+        let mut anchor_index = None;
+
+        super::apply_selection_mode(
+            &mut selected_indices,
+            &mut anchor_index,
+            2,
+            super::SelectionMode::Range,
+        );
+
+        assert_eq!(HashSet::from([2usize]), selected_indices);
+        assert_eq!(Some(2), anchor_index);
+    }
+
+    #[test]
+    fn toggle_selection_updates_anchor_without_clearing_other_rows() {
+        let mut selected_indices = HashSet::from([0usize, 2]);
+        let mut anchor_index = Some(0usize);
+
+        super::apply_selection_mode(
+            &mut selected_indices,
+            &mut anchor_index,
+            3,
+            super::SelectionMode::Toggle,
+        );
+
+        assert_eq!(HashSet::from([0usize, 2, 3]), selected_indices);
+        assert_eq!(Some(3), anchor_index);
+    }
+}
+
 impl gpui::EventEmitter<FileListPanelEvent> for FileListPanel {}
 
 impl Focusable for FileListPanel {
@@ -1024,164 +1256,193 @@ impl Render for FileListPanel {
         } else {
             filtered_count
         };
+        let scroll_handle = self.scroll_handle.clone();
 
         v_flex()
             .size_full()
             .child(self.render_search_bar(cx))
             .child(self.render_header(cx))
             .child(
-                uniform_list("file-list", total_count, {
-                    cx.processor(move |state: &mut Self, range: Range<usize>, _window, cx| {
-                        let current_path = state.current_path.clone();
-                        let is_remote = state.is_remote;
-                        let has_parent = !state.is_at_root();
-                        let view = cx.entity();
-                        range
-                            .map(|list_ix| {
-                                if has_parent && list_ix == 0 {
-                                    return div()
-                                        .id(list_ix)
-                                        .cursor_pointer()
-                                        .on_double_click(cx.listener(
-                                            move |_this, _, _window, cx| {
-                                                cx.emit(FileListPanelEvent::ItemDoubleClicked {
-                                                    name: "..".to_string(),
-                                                    full_path: "..".to_string(),
-                                                    is_dir: true,
-                                                });
-                                            },
-                                        ))
-                                        .child(state.render_parent_row(cx))
-                                        .into_any_element();
-                                }
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .relative()
+                    .child(
+                        uniform_list("file-list", total_count, {
+                            cx.processor(
+                                move |state: &mut Self, range: Range<usize>, _window, cx| {
+                                    let current_path = state.current_path.clone();
+                                    let is_remote = state.is_remote;
+                                    let has_parent = !state.is_at_root();
+                                    let view = cx.entity();
+                                    range
+                                        .map(|list_ix| {
+                                            if has_parent && list_ix == 0 {
+                                                return div()
+                                                    .id(list_ix)
+                                                    .cursor_pointer()
+                                                    .on_double_click(cx.listener(
+                                                        move |_this, _, _window, cx| {
+                                                            cx.emit(
+                                                            FileListPanelEvent::ItemDoubleClicked {
+                                                                name: "..".to_string(),
+                                                                full_path: "..".to_string(),
+                                                                is_dir: true,
+                                                            },
+                                                        );
+                                                        },
+                                                    ))
+                                                    .child(state.render_parent_row(cx))
+                                                    .into_any_element();
+                                            }
 
-                                let filtered_ix = if has_parent { list_ix - 1 } else { list_ix };
-                                let real_ix = state.filtered_indices[filtered_ix];
-                                let item = &state.items[real_ix];
-                                let is_selected = state.selected_indices.contains(&filtered_ix);
-                                let item_name = item.name.clone();
-                                let is_dir = item.is_dir;
-                                let full_path = if is_remote {
-                                    if current_path.ends_with('/') {
-                                        format!("{}{}", current_path, item_name)
-                                    } else {
-                                        format!("{}/{}", current_path, item_name)
-                                    }
-                                } else {
-                                    std::path::Path::new(&current_path)
-                                        .join(&item_name)
-                                        .to_string_lossy()
-                                        .to_string()
-                                };
+                                            let filtered_ix =
+                                                if has_parent { list_ix - 1 } else { list_ix };
+                                            let real_ix = state.filtered_indices[filtered_ix];
+                                            let item = &state.items[real_ix];
+                                            let is_selected =
+                                                state.selected_indices.contains(&filtered_ix);
+                                            let item_name = item.name.clone();
+                                            let is_dir = item.is_dir;
+                                            let full_path = if is_remote {
+                                                if current_path.ends_with('/') {
+                                                    format!("{}{}", current_path, item_name)
+                                                } else {
+                                                    format!("{}/{}", current_path, item_name)
+                                                }
+                                            } else {
+                                                std::path::Path::new(&current_path)
+                                                    .join(&item_name)
+                                                    .to_string_lossy()
+                                                    .to_string()
+                                            };
 
-                                // 构建拖拽项目列表
-                                // 如果当前文件在选中列表中且有多个选中项，则拖拽所有选中项
-                                // 否则只拖拽当前文件
-                                let drag_items = if state.selected_indices.contains(&filtered_ix)
-                                    && state.selected_indices.len() > 1
-                                {
-                                    // 拖拽所有选中的文件
-                                    let items: Vec<DraggedFileItem> = state
-                                        .selected_indices
-                                        .iter()
-                                        .filter_map(|&idx| {
-                                            state.filtered_indices.get(idx).and_then(|&real_ix| {
-                                                state.items.get(real_ix).map(|item| {
-                                                    let item_path = if is_remote {
-                                                        if current_path.ends_with('/') {
-                                                            format!("{}{}", current_path, item.name)
-                                                        } else {
-                                                            format!(
-                                                                "{}/{}",
-                                                                current_path, item.name
-                                                            )
-                                                        }
-                                                    } else {
-                                                        std::path::Path::new(&current_path)
-                                                            .join(&item.name)
-                                                            .to_string_lossy()
-                                                            .to_string()
-                                                    };
-                                                    DraggedFileItem {
-                                                        name: item.name.clone(),
-                                                        is_dir: item.is_dir,
-                                                        full_path: item_path,
-                                                        is_remote,
-                                                    }
+                                            let drag_items =
+                                                if state.selected_indices.contains(&filtered_ix)
+                                                    && state.selected_indices.len() > 1
+                                                {
+                                                    let items: Vec<DraggedFileItem> = state
+                                                .selected_indices
+                                                .iter()
+                                                .filter_map(|&idx| {
+                                                    state.filtered_indices.get(idx).and_then(
+                                                        |&real_ix| {
+                                                            state.items.get(real_ix).map(|item| {
+                                                                let item_path = if is_remote {
+                                                                    if current_path.ends_with('/') {
+                                                                        format!(
+                                                                            "{}{}",
+                                                                            current_path, item.name
+                                                                        )
+                                                                    } else {
+                                                                        format!(
+                                                                            "{}/{}",
+                                                                            current_path, item.name
+                                                                        )
+                                                                    }
+                                                                } else {
+                                                                    std::path::Path::new(
+                                                                        &current_path,
+                                                                    )
+                                                                    .join(&item.name)
+                                                                    .to_string_lossy()
+                                                                    .to_string()
+                                                                };
+                                                                DraggedFileItem {
+                                                                    name: item.name.clone(),
+                                                                    is_dir: item.is_dir,
+                                                                    full_path: item_path,
+                                                                    is_remote,
+                                                                }
+                                                            })
+                                                        },
+                                                    )
                                                 })
+                                                .collect();
+                                                    DraggedFileItems::multiple(items, is_remote)
+                                                } else {
+                                                    DraggedFileItems::single(DraggedFileItem {
+                                                        name: item_name.clone(),
+                                                        is_dir,
+                                                        full_path: full_path.clone(),
+                                                        is_remote,
+                                                    })
+                                                };
+
+                                            let ctx_name = item_name.clone();
+                                            let ctx_full_path = full_path.clone();
+                                            let ctx_is_dir = is_dir;
+                                            let ctx_is_remote = is_remote;
+                                            let ctx_view = view.clone();
+
+                                            div()
+                                            .id(list_ix)
+                                            .cursor_pointer()
+                                            .on_drag(drag_items, |drag, _, _, cx| {
+                                                cx.new(|_| drag.clone())
                                             })
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    move |this,
+                                                          event: &MouseDownEvent,
+                                                          _window,
+                                                          cx| {
+                                                        let mode = selection_mode(
+                                                            event.modifiers.shift,
+                                                            event.modifiers.secondary(),
+                                                        );
+                                                        this.select_row(filtered_ix, mode);
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            )
+                                            .on_double_click(cx.listener({
+                                                let name = item_name.clone();
+                                                let full_path = full_path.clone();
+                                                move |_this, _, _window, cx| {
+                                                    cx.emit(
+                                                        FileListPanelEvent::ItemDoubleClicked {
+                                                            name: name.clone(),
+                                                            full_path: full_path.clone(),
+                                                            is_dir,
+                                                        },
+                                                    );
+                                                }
+                                            }))
+                                            .context_menu(move |menu, window, cx| {
+                                                Self::build_file_context_menu(
+                                                    menu,
+                                                    filtered_ix,
+                                                    &ctx_name,
+                                                    &ctx_full_path,
+                                                    ctx_is_dir,
+                                                    ctx_is_remote,
+                                                    &ctx_view,
+                                                    window,
+                                                    cx,
+                                                )
+                                            })
+                                            .child(state.render_file_row(
+                                                filtered_ix,
+                                                item,
+                                                is_selected,
+                                                cx,
+                                            ))
+                                            .into_any_element()
                                         })
-                                        .collect();
-                                    DraggedFileItems::multiple(items, is_remote)
-                                } else {
-                                    // 只拖拽当前文件
-                                    DraggedFileItems::single(DraggedFileItem {
-                                        name: item_name.clone(),
-                                        is_dir,
-                                        full_path: full_path.clone(),
-                                        is_remote,
-                                    })
-                                };
-
-                                // 右键菜单需要的变量
-                                let ctx_name = item_name.clone();
-                                let ctx_full_path = full_path.clone();
-                                let ctx_is_dir = is_dir;
-                                let ctx_is_remote = is_remote;
-                                let ctx_view = view.clone();
-
-                                div()
-                                    .id(list_ix)
-                                    .cursor_pointer()
-                                    .on_drag(drag_items, |drag, _, _, cx| cx.new(|_| drag.clone()))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(
-                                            move |this, event: &MouseDownEvent, _window, cx| {
-                                                let multi_select = event.modifiers.secondary();
-                                                this.toggle_selection(filtered_ix, multi_select);
-                                                cx.notify();
-                                            },
-                                        ),
-                                    )
-                                    .on_double_click(cx.listener({
-                                        let name = item_name.clone();
-                                        let full_path = full_path.clone();
-                                        move |_this, _, _window, cx| {
-                                            cx.emit(FileListPanelEvent::ItemDoubleClicked {
-                                                name: name.clone(),
-                                                full_path: full_path.clone(),
-                                                is_dir,
-                                            });
-                                        }
-                                    }))
-                                    .context_menu(move |menu, window, cx| {
-                                        Self::build_file_context_menu(
-                                            menu,
-                                            &ctx_name,
-                                            &ctx_full_path,
-                                            ctx_is_dir,
-                                            ctx_is_remote,
-                                            &ctx_view,
-                                            window,
-                                            cx,
-                                        )
-                                    })
-                                    .child(state.render_file_row(
-                                        filtered_ix,
-                                        item,
-                                        is_selected,
-                                        cx,
-                                    ))
-                                    .into_any_element()
-                            })
-                            .collect()
-                    })
-                })
-                .flex_1()
-                .size_full()
-                .track_scroll(&self.scroll_handle)
-                .with_sizing_behavior(ListSizingBehavior::Auto),
+                                        .collect()
+                                },
+                            )
+                        })
+                        .flex_1()
+                        .size_full()
+                        .track_scroll(&scroll_handle)
+                        .with_sizing_behavior(ListSizingBehavior::Auto),
+                    )
+                    .vertical_scrollbar(&scroll_handle),
             )
     }
 }

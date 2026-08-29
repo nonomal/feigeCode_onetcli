@@ -9,9 +9,9 @@ pub use file_list_panel::{
 };
 
 use gpui::{
-    App, AsyncApp, Context, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
-    FontWeight, Hsla, IntoElement, ParentElement, Render, SharedString, Styled, WeakEntity, Window,
-    actions, div, prelude::*, px,
+    AnyElement, App, AsyncApp, Context, Entity, EventEmitter, ExternalPaths, FocusHandle,
+    Focusable, FontWeight, Hsla, IntoElement, MouseButton, ParentElement, Render, SharedString,
+    Styled, WeakEntity, Window, actions, div, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable, Size, WindowExt,
@@ -19,9 +19,11 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     dialog::DialogButtonProps,
     h_flex,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     notification::Notification,
+    popover::{Popover, PopoverState},
     progress::Progress,
+    scroll::ScrollableElement,
     spinner::Spinner,
     tooltip::Tooltip,
     v_flex,
@@ -30,11 +32,24 @@ use one_core::gpui_tokio::Tokio;
 use one_core::storage::models::{
     ActiveConnections, ProxyType as StorageProxyType, SshAuthMethod, StoredConnection,
 };
+use one_core::storage::{
+    GlobalStorageState, SftpFavoritePathRepository, normalize_sftp_favorite_path,
+    sftp_favorite_connection_key,
+};
 use one_core::tab_container::{TabContent, TabContentEvent};
-use remote_file_editor::open_remote_file_editor;
+use remote_file_editor::{
+    ExternalEditorOpenRequest, RemoteMutationCallback, open_remote_file_editor,
+    open_remote_file_external_editor,
+};
+use remote_image_preview::{
+    clipboard_upload_paths, image_format_for_path, open_remote_image_preview,
+};
 use rust_i18n::t;
 use sftp::{RusshSftpClient, SftpClient, TransferCancelled, TransferProgress};
-use ssh::{JumpServerConnectConfig, ProxyConnectConfig, ProxyType, SshAuth, SshConnectConfig};
+use ssh::{
+    ChannelEvent, JumpServerConnectConfig, ProxyConnectConfig, ProxyType, SshAuth, SshChannel,
+    SshConnectConfig, SshSessionManager,
+};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,9 +66,12 @@ actions!(
         Download,
         Delete,
         NewFolder,
-        Rename
+        Rename,
+        PasteUpload
     ]
 );
+
+pub const SFTP_VIEW_CONTEXT: &str = "SftpView";
 
 /// SftpView 发出的事件
 #[derive(Clone, Debug)]
@@ -80,8 +98,15 @@ enum PanelSide {
     Remote,
 }
 
+#[derive(Clone, PartialEq)]
+struct FavoritePathEdit {
+    side: PanelSide,
+    original_path: String,
+}
+
 const MAX_CONCURRENT_TRANSFERS: usize = 2;
 const BREADCRUMB_ITEM_MAX_WIDTH: f32 = 180.0;
+const LOCAL_FAVORITE_CONNECTION_KEY: &str = "local-file-list:global";
 
 struct TransferClientPool {
     config: SshConnectConfig,
@@ -164,6 +189,18 @@ struct LocalFileEntry {
     size: u64,
     modified: SystemTime,
     is_dir: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveExtract {
+    name: String,
+    path: String,
+}
+
+struct RemoteCommandOutput {
+    stdout: String,
+    stderr: String,
+    exit_status: u32,
 }
 
 impl TransferClientPool {
@@ -315,6 +352,204 @@ fn join_remote_path(base: &str, name: &str) -> String {
     }
 }
 
+fn remote_path_parent(path: &str) -> String {
+    if path == "/" || path.is_empty() {
+        ".".to_string()
+    } else {
+        let trimmed = path.trim_end_matches('/');
+        match trimmed.rfind('/') {
+            Some(0) => "/".to_string(),
+            Some(pos) => trimmed[..pos].to_string(),
+            None => ".".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArchiveKind {
+    Zip,
+    Tar,
+    TarGz,
+    Tgz,
+    TarBz2,
+    Tbz2,
+    TarXz,
+    Txz,
+    Gzip,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExtractConflictAction {
+    Overwrite,
+    SkipExisting,
+}
+
+pub(crate) fn archive_kind_for_name(name: &str) -> Option<ArchiveKind> {
+    let lower = name.to_lowercase();
+    [
+        (".tar.gz", ArchiveKind::TarGz),
+        (".tar.bz2", ArchiveKind::TarBz2),
+        (".tar.xz", ArchiveKind::TarXz),
+        (".tgz", ArchiveKind::Tgz),
+        (".tbz2", ArchiveKind::Tbz2),
+        (".txz", ArchiveKind::Txz),
+        (".tar", ArchiveKind::Tar),
+        (".zip", ArchiveKind::Zip),
+        (".gz", ArchiveKind::Gzip),
+    ]
+    .into_iter()
+    .find_map(|(suffix, kind)| lower.ends_with(suffix).then_some(kind))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+pub(crate) fn build_remote_extract_command(
+    path: &str,
+    name: &str,
+    action: ExtractConflictAction,
+) -> Option<String> {
+    let quoted_path = shell_quote(path);
+    let quoted_parent = shell_quote(&remote_path_parent(path));
+    let tar_skip = match action {
+        ExtractConflictAction::Overwrite => "",
+        ExtractConflictAction::SkipExisting => " --skip-old-files",
+    };
+
+    match (archive_kind_for_name(name)?, action) {
+        (ArchiveKind::Zip, ExtractConflictAction::Overwrite) => {
+            Some(format!("unzip -o -- {quoted_path} -d {quoted_parent}"))
+        }
+        (ArchiveKind::Zip, ExtractConflictAction::SkipExisting) => {
+            Some(format!("unzip -n -- {quoted_path} -d {quoted_parent}"))
+        }
+        (ArchiveKind::Tar, _) => Some(format!(
+            "tar{tar_skip} -xf {quoted_path} -C {quoted_parent}"
+        )),
+        (ArchiveKind::TarGz | ArchiveKind::Tgz, _) => Some(format!(
+            "tar{tar_skip} -xzf {quoted_path} -C {quoted_parent}"
+        )),
+        (ArchiveKind::TarBz2 | ArchiveKind::Tbz2, _) => Some(format!(
+            "tar{tar_skip} -xjf {quoted_path} -C {quoted_parent}"
+        )),
+        (ArchiveKind::TarXz | ArchiveKind::Txz, _) => Some(format!(
+            "tar{tar_skip} -xJf {quoted_path} -C {quoted_parent}"
+        )),
+        (ArchiveKind::Gzip, ExtractConflictAction::Overwrite) => {
+            Some(format!("gzip -dkf -- {quoted_path}"))
+        }
+        (ArchiveKind::Gzip, ExtractConflictAction::SkipExisting) => Some(format!(
+            "test -e {} || gzip -dk -- {quoted_path}",
+            shell_quote(&remote_gzip_target_path(path))
+        )),
+    }
+}
+
+fn remote_gzip_target_path(path: &str) -> String {
+    path.strip_suffix(".gz").unwrap_or(path).to_string()
+}
+
+fn build_archive_top_level_conflict_check_command(path: &str, list_command: String) -> String {
+    let quoted_parent = shell_quote(&remote_path_parent(path));
+    format!(
+        "parent={quoted_parent}; tmp=$(mktemp) || exit 2; if ! {list_command} > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; exit 2; fi; awk -F/ 'NF {{ print $1 }}' \"$tmp\" | sort -u | while IFS= read -r entry; do [ -n \"$entry\" ] || continue; if [ -e \"$parent/$entry\" ]; then printf '%s\\n' \"$entry\"; exit 7; fi; done; status=$?; rm -f \"$tmp\"; if [ \"$status\" -eq 7 ]; then exit 0; fi; exit 1"
+    )
+}
+
+pub(crate) fn build_remote_extract_conflict_check_command(
+    path: &str,
+    name: &str,
+) -> Option<String> {
+    let quoted_path = shell_quote(path);
+    match archive_kind_for_name(name)? {
+        ArchiveKind::Zip => Some(build_archive_top_level_conflict_check_command(
+            path,
+            format!("unzip -Z1 -- {quoted_path}"),
+        )),
+        ArchiveKind::Tar
+        | ArchiveKind::TarGz
+        | ArchiveKind::Tgz
+        | ArchiveKind::TarBz2
+        | ArchiveKind::Tbz2
+        | ArchiveKind::TarXz
+        | ArchiveKind::Txz => Some(build_archive_top_level_conflict_check_command(
+            path,
+            format!("tar -tf {quoted_path}"),
+        )),
+        ArchiveKind::Gzip => Some(format!(
+            "test -e {}",
+            shell_quote(&remote_gzip_target_path(path))
+        )),
+    }
+}
+
+pub(crate) async fn exec_remote_command(
+    session_manager: Arc<SshSessionManager>,
+    command: &str,
+) -> anyhow::Result<String> {
+    let output = exec_remote_command_output(session_manager, command).await?;
+    if output.exit_status != 0 {
+        anyhow::bail!(
+            "remote command exited with status {}: {}",
+            output.exit_status,
+            output.stderr
+        );
+    }
+
+    Ok(output.stdout)
+}
+
+pub(crate) async fn exec_remote_command_output(
+    session_manager: Arc<SshSessionManager>,
+    command: &str,
+) -> anyhow::Result<RemoteCommandOutput> {
+    let mut channel = session_manager.open_channel().await?;
+    channel.exec(command).await?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_status = 0u32;
+
+    while let Some(event) = channel.recv().await {
+        match event {
+            ChannelEvent::Data(data) => stdout.extend(data),
+            ChannelEvent::ExtendedData { data, .. } => stderr.extend(data),
+            ChannelEvent::ExitStatus(status) => exit_status = status,
+            ChannelEvent::ExitSignal {
+                signal_name,
+                error_message,
+            } => {
+                anyhow::bail!("remote command failed with signal {signal_name}: {error_message}");
+            }
+            ChannelEvent::Eof | ChannelEvent::Close => break,
+        }
+    }
+
+    let _ = channel.close().await;
+    Ok(RemoteCommandOutput {
+        stdout: String::from_utf8_lossy(&stdout).to_string(),
+        stderr: String::from_utf8_lossy(&stderr).to_string(),
+        exit_status,
+    })
+}
+
+pub(crate) async fn remote_extract_has_conflict(
+    session_manager: Arc<SshSessionManager>,
+    command: &str,
+) -> anyhow::Result<bool> {
+    let output = exec_remote_command_output(session_manager, command).await?;
+    match output.exit_status {
+        0 => Ok(true),
+        1 => Ok(false),
+        status => anyhow::bail!(
+            "remote conflict check exited with status {}: {}",
+            status,
+            output.stderr
+        ),
+    }
+}
+
 fn should_apply_remote_listing(current_path: &str, listed_path: &str) -> bool {
     current_path == listed_path
 }
@@ -337,7 +572,7 @@ fn is_valid_entry_name(name: &str) -> bool {
 
 fn breadcrumb_item(label: impl Into<SharedString>) -> BreadcrumbItem {
     BreadcrumbItem::new(label)
-        .flex_shrink()
+        .flex_shrink(1.0)
         .min_w(px(0.))
         .max_w(px(BREADCRUMB_ITEM_MAX_WIDTH))
         .overflow_hidden()
@@ -439,10 +674,17 @@ pub struct SftpView {
     remote_path_editing: bool,
     local_path_input: Entity<InputState>,
     remote_path_input: Entity<InputState>,
+    local_favorite_popover_open: bool,
+    remote_favorite_popover_open: bool,
+    local_favorite_search_input: Entity<InputState>,
+    remote_favorite_search_input: Entity<InputState>,
+    favorite_edit_input: Entity<InputState>,
+    favorite_editing: Option<FavoritePathEdit>,
 
     transfer_queue: TransferQueue,
     next_task_id: usize,
     transfer_client_pool: Arc<Mutex<TransferClientPool>>,
+    active_extract: Option<ActiveExtract>,
 
     focus_handle: FocusHandle,
 
@@ -450,6 +692,11 @@ pub struct SftpView {
     is_dragging_over_remote: bool,
 
     remote_loading: bool,
+    local_favorite_paths: Vec<String>,
+    local_favorite_connection_key: String,
+    favorite_paths: Vec<String>,
+    favorite_connection_id: Option<i64>,
+    favorite_connection_key: String,
 
     progress_refresh_task: Option<gpui::Task<()>>,
     _subscriptions: Vec<gpui::Subscription>,
@@ -485,6 +732,14 @@ impl SftpView {
                 passphrase,
                 certificate_path: None,
             },
+            SshAuthMethod::PrivateKeyContent {
+                private_key,
+                passphrase,
+            } => SshAuth::PrivateKeyContent {
+                private_key,
+                passphrase,
+                certificate_path: None,
+            },
             SshAuthMethod::Agent => SshAuth::Agent,
             SshAuthMethod::AutoPublicKey => SshAuth::AutoPublicKey,
         };
@@ -505,6 +760,14 @@ impl SftpView {
                         passphrase,
                     } => SshAuth::PrivateKey {
                         key_path,
+                        passphrase,
+                        certificate_path: None,
+                    },
+                    SshAuthMethod::PrivateKeyContent {
+                        private_key,
+                        passphrase,
+                    } => SshAuth::PrivateKeyContent {
+                        private_key,
                         passphrase,
                         certificate_path: None,
                     },
@@ -552,6 +815,19 @@ impl SftpView {
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter path..."));
         let remote_path_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter path..."));
+        let local_favorite_search_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("FavoritePath.search_placeholder"))
+        });
+        let remote_favorite_search_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("FavoritePath.search_placeholder"))
+        });
+        let favorite_edit_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder(t!("FavoritePath.edit_placeholder")));
+        let favorite_connection_id = conn.id;
+        let favorite_connection_key = sftp_favorite_connection_key(&conn);
+        let local_favorite_connection_key = LOCAL_FAVORITE_CONNECTION_KEY.to_string();
+        let local_favorite_paths = Self::load_favorite_paths(&local_favorite_connection_key, cx);
+        let favorite_paths = Self::load_favorite_paths(&favorite_connection_key, cx);
 
         let mut subscriptions = Vec::new();
 
@@ -629,6 +905,32 @@ impl SftpView {
             },
         ));
 
+        subscriptions.push(cx.subscribe(
+            &local_favorite_search_input,
+            |_this, _, event: &InputEvent, cx| {
+                if let InputEvent::Change = event {
+                    cx.notify();
+                }
+            },
+        ));
+        subscriptions.push(cx.subscribe(
+            &remote_favorite_search_input,
+            |_this, _, event: &InputEvent, cx| {
+                if let InputEvent::Change = event {
+                    cx.notify();
+                }
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
+            &favorite_edit_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.save_editing_favorite_path(window, cx);
+                }
+            },
+        ));
+
         let transfer_client_pool = Arc::new(Mutex::new(TransferClientPool::new(
             config.clone(),
             MAX_CONCURRENT_TRANSFERS,
@@ -651,13 +953,25 @@ impl SftpView {
             remote_path_editing: false,
             local_path_input,
             remote_path_input,
+            local_favorite_popover_open: false,
+            remote_favorite_popover_open: false,
+            local_favorite_search_input,
+            remote_favorite_search_input,
+            favorite_edit_input,
+            favorite_editing: None,
             transfer_queue: TransferQueue::new(MAX_CONCURRENT_TRANSFERS),
             next_task_id: 0,
             transfer_client_pool,
+            active_extract: None,
             focus_handle,
             is_dragging_over_local: false,
             is_dragging_over_remote: false,
             remote_loading: false,
+            local_favorite_paths,
+            local_favorite_connection_key,
+            favorite_paths,
+            favorite_connection_id,
+            favorite_connection_key,
             progress_refresh_task: None,
             _subscriptions: subscriptions,
             connection_name: conn.name,
@@ -912,9 +1226,24 @@ impl SftpView {
             self.push_remote_history(self.remote_current_path.clone());
             self.refresh_remote_dir(cx);
         } else {
-            self.open_remote_editor(full_path, window, cx);
+            self.open_remote_file(full_path, window, cx);
         }
         cx.notify();
+    }
+
+    fn open_remote_file(&self, full_path: String, window: &mut Window, cx: &mut Context<Self>) {
+        if image_format_for_path(&full_path).is_some() {
+            let Some(client) = self.sftp_client.clone() else {
+                window.push_notification(
+                    Notification::error("SFTP client is not connected".to_string()),
+                    cx,
+                );
+                return;
+            };
+            open_remote_image_preview(full_path, client, window, cx);
+        } else {
+            self.open_remote_editor(full_path, window, cx);
+        }
     }
 
     fn open_remote_editor(&self, full_path: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -926,7 +1255,40 @@ impl SftpView {
             return;
         };
 
-        open_remote_file_editor(full_path, client, cx);
+        open_remote_file_editor(full_path, client, self.remote_mutation_callback(cx), cx);
+    }
+
+    fn open_remote_external_editor(
+        &self,
+        selection: (String, String),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (full_path, editor_key) = selection;
+        let Some(client) = self.sftp_client.clone() else {
+            window.push_notification(
+                Notification::error("SFTP client is not connected".to_string()),
+                cx,
+            );
+            return;
+        };
+        open_remote_file_external_editor(
+            ExternalEditorOpenRequest {
+                remote_path: full_path,
+                editor_key,
+                client,
+                on_remote_changed: self.remote_mutation_callback(cx),
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn remote_mutation_callback(&self, cx: &Context<Self>) -> RemoteMutationCallback {
+        let view = cx.entity().downgrade();
+        RemoteMutationCallback::new(move |cx| {
+            let _ = view.update(cx, |this, cx| this.refresh_remote_dir(cx));
+        })
     }
 
     fn navigate_local_to(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1054,6 +1416,584 @@ impl SftpView {
 
     fn can_go_forward_remote(&self) -> bool {
         self.remote_history_index + 1 < self.remote_history.len()
+    }
+
+    fn is_current_remote_path_favorite(&self) -> bool {
+        let Some(path) = normalize_sftp_favorite_path(&self.remote_current_path) else {
+            return false;
+        };
+        self.favorite_paths.iter().any(|existing| existing == &path)
+    }
+
+    fn is_current_local_path_favorite(&self) -> bool {
+        let path = self.local_current_path.to_string_lossy();
+        let Some(path) = normalize_sftp_favorite_path(&path) else {
+            return false;
+        };
+        self.local_favorite_paths
+            .iter()
+            .any(|existing| existing == &path)
+    }
+
+    fn remote_favorite_paths(&self) -> Vec<String> {
+        self.favorite_paths.clone()
+    }
+
+    fn local_favorite_paths(&self) -> Vec<String> {
+        self.local_favorite_paths.clone()
+    }
+
+    fn toggle_current_remote_favorite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = normalize_sftp_favorite_path(&self.remote_current_path) else {
+            return;
+        };
+        let Some(repo) = Self::favorite_path_repository(cx) else {
+            window.push_notification(
+                Notification::error(
+                    t!(
+                        "FavoritePath.save_failed",
+                        error = "SftpFavoritePathRepository not found"
+                    )
+                    .to_string(),
+                ),
+                cx,
+            );
+            return;
+        };
+
+        let is_favorite = self.is_current_remote_path_favorite();
+        let result = if is_favorite {
+            repo.remove_path(&self.favorite_connection_key, &path)
+        } else {
+            repo.add_path(
+                self.favorite_connection_id,
+                &self.favorite_connection_key,
+                &path,
+            )
+        };
+
+        match result {
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(t!("FavoritePath.save_failed", error = error).to_string()),
+                    cx,
+                );
+                return;
+            }
+        }
+
+        self.refresh_remote_favorite_paths(cx);
+        let message = if is_favorite {
+            t!("FavoritePath.removed").to_string()
+        } else {
+            t!("FavoritePath.added").to_string()
+        };
+        window.push_notification(Notification::success(message), cx);
+        cx.notify();
+    }
+
+    fn toggle_current_local_favorite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.local_current_path.to_string_lossy().to_string();
+        let is_favorite = self.is_current_local_path_favorite();
+        let result = if is_favorite {
+            self.remove_favorite_path(&self.local_favorite_connection_key, &path, cx)
+        } else {
+            self.insert_favorite_path(&self.local_favorite_connection_key, &path, cx)
+        };
+
+        match result {
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(t!("FavoritePath.save_failed", error = error).to_string()),
+                    cx,
+                );
+                return;
+            }
+        }
+
+        self.refresh_local_favorite_paths(cx);
+        let message = if is_favorite {
+            t!("FavoritePath.removed").to_string()
+        } else {
+            t!("FavoritePath.added").to_string()
+        };
+        window.push_notification(Notification::success(message), cx);
+        cx.notify();
+    }
+
+    fn add_remote_favorite_path(
+        &mut self,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = normalize_sftp_favorite_path(path) else {
+            return;
+        };
+        let Some(repo) = Self::favorite_path_repository(cx) else {
+            window.push_notification(
+                Notification::error(
+                    t!(
+                        "FavoritePath.save_failed",
+                        error = "SftpFavoritePathRepository not found"
+                    )
+                    .to_string(),
+                ),
+                cx,
+            );
+            return;
+        };
+
+        match repo.add_path(
+            self.favorite_connection_id,
+            &self.favorite_connection_key,
+            &path,
+        ) {
+            Ok(false) => return,
+            Ok(true) => {
+                self.refresh_remote_favorite_paths(cx);
+                window.push_notification(
+                    Notification::success(t!("FavoritePath.added").to_string()),
+                    cx,
+                );
+                cx.notify();
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(t!("FavoritePath.save_failed", error = error).to_string()),
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn add_local_favorite_path(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.insert_favorite_path(&self.local_favorite_connection_key, path, cx) {
+            Ok(false) => return,
+            Ok(true) => {
+                self.refresh_local_favorite_paths(cx);
+                window.push_notification(
+                    Notification::success(t!("FavoritePath.added").to_string()),
+                    cx,
+                );
+                cx.notify();
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(t!("FavoritePath.save_failed", error = error).to_string()),
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn refresh_remote_favorite_paths(&mut self, cx: &mut Context<Self>) {
+        self.favorite_paths = Self::load_favorite_paths(&self.favorite_connection_key, cx);
+    }
+
+    fn refresh_local_favorite_paths(&mut self, cx: &mut Context<Self>) {
+        self.local_favorite_paths =
+            Self::load_favorite_paths(&self.local_favorite_connection_key, cx);
+    }
+
+    fn load_favorite_paths(connection_key: &str, cx: &mut Context<Self>) -> Vec<String> {
+        let Some(repo) = Self::favorite_path_repository(cx) else {
+            tracing::error!("SftpFavoritePathRepository not found");
+            return Vec::new();
+        };
+
+        match repo.list_paths(connection_key) {
+            Ok(paths) => paths,
+            Err(error) => {
+                tracing::error!("Failed to load SFTP favorite paths: {}", error);
+                Vec::new()
+            }
+        }
+    }
+
+    fn favorite_path_repository(cx: &mut Context<Self>) -> Option<Arc<SftpFavoritePathRepository>> {
+        let storage = cx.global::<GlobalStorageState>().storage.clone();
+        storage.get::<SftpFavoritePathRepository>()
+    }
+
+    fn insert_favorite_path(
+        &self,
+        connection_key: &str,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<bool> {
+        let Some(repo) = Self::favorite_path_repository(cx) else {
+            return Err(anyhow::anyhow!("SftpFavoritePathRepository not found"));
+        };
+        let connection_id = if connection_key == self.local_favorite_connection_key {
+            None
+        } else {
+            self.favorite_connection_id
+        };
+        repo.add_path(connection_id, connection_key, path)
+    }
+
+    fn remove_favorite_path(
+        &self,
+        connection_key: &str,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<bool> {
+        let Some(repo) = Self::favorite_path_repository(cx) else {
+            return Err(anyhow::anyhow!("SftpFavoritePathRepository not found"));
+        };
+        repo.remove_path(connection_key, path)
+    }
+
+    fn update_favorite_path(
+        &self,
+        connection_key: &str,
+        old_path: &str,
+        new_path: &str,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<bool> {
+        let Some(repo) = Self::favorite_path_repository(cx) else {
+            return Err(anyhow::anyhow!("SftpFavoritePathRepository not found"));
+        };
+        repo.update_path(connection_key, old_path, new_path)
+    }
+
+    fn favorite_connection_key_for_side(&self, side: PanelSide) -> &str {
+        match side {
+            PanelSide::Local => &self.local_favorite_connection_key,
+            PanelSide::Remote => &self.favorite_connection_key,
+        }
+    }
+
+    fn refresh_favorite_paths_for_side(&mut self, side: PanelSide, cx: &mut Context<Self>) {
+        match side {
+            PanelSide::Local => self.refresh_local_favorite_paths(cx),
+            PanelSide::Remote => self.refresh_remote_favorite_paths(cx),
+        }
+    }
+
+    fn remove_favorite_path_for_side(
+        &mut self,
+        side: PanelSide,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let connection_key = self.favorite_connection_key_for_side(side).to_string();
+        match self.remove_favorite_path(&connection_key, path, cx) {
+            Ok(false) => return,
+            Ok(true) => {
+                self.refresh_favorite_paths_for_side(side, cx);
+                if self
+                    .favorite_editing
+                    .as_ref()
+                    .is_some_and(|editing| editing.side == side && editing.original_path == path)
+                {
+                    self.favorite_editing = None;
+                }
+                window.push_notification(
+                    Notification::success(t!("FavoritePath.removed").to_string()),
+                    cx,
+                );
+                cx.notify();
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(t!("FavoritePath.save_failed", error = error).to_string()),
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn start_favorite_path_editing(
+        &mut self,
+        side: PanelSide,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.favorite_editing = Some(FavoritePathEdit {
+            side,
+            original_path: path.clone(),
+        });
+        self.favorite_edit_input.update(cx, |state, cx| {
+            state.set_value(&path, window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn cancel_favorite_path_editing(&mut self, cx: &mut Context<Self>) {
+        if self.favorite_editing.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn save_editing_favorite_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editing) = self.favorite_editing.clone() else {
+            return;
+        };
+        let new_path = self.favorite_edit_input.read(cx).text().to_string();
+        let connection_key = self
+            .favorite_connection_key_for_side(editing.side)
+            .to_string();
+
+        match self.update_favorite_path(&connection_key, &editing.original_path, &new_path, cx) {
+            Ok(false) => return,
+            Ok(true) => {
+                self.favorite_editing = None;
+                self.refresh_favorite_paths_for_side(editing.side, cx);
+                window.push_notification(
+                    Notification::success(t!("FavoritePath.updated").to_string()),
+                    cx,
+                );
+                cx.notify();
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(t!("FavoritePath.save_failed", error = error).to_string()),
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn render_remote_favorites_menu(
+        &self,
+        favorite_paths: Vec<String>,
+        is_connected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        self.render_favorite_paths_popover(PanelSide::Remote, favorite_paths, is_connected, cx)
+    }
+
+    fn render_local_favorites_menu(
+        &self,
+        favorite_paths: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        self.render_favorite_paths_popover(PanelSide::Local, favorite_paths, true, cx)
+    }
+
+    fn render_favorite_paths_popover(
+        &self,
+        side: PanelSide,
+        favorite_paths: Vec<String>,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let popover_id = match side {
+            PanelSide::Local => "local_favorite_paths_popover",
+            PanelSide::Remote => "remote_favorite_paths_popover",
+        };
+        let button_id = match side {
+            PanelSide::Local => "local_favorite_paths",
+            PanelSide::Remote => "remote_favorite_paths",
+        };
+        let open = match side {
+            PanelSide::Local => self.local_favorite_popover_open,
+            PanelSide::Remote => self.remote_favorite_popover_open,
+        };
+        let search_input = match side {
+            PanelSide::Local => self.local_favorite_search_input.clone(),
+            PanelSide::Remote => self.remote_favorite_search_input.clone(),
+        };
+        let edit_input = self.favorite_edit_input.clone();
+        let editing = self.favorite_editing.clone();
+        let view = cx.entity().clone();
+        let query = search_input.read(cx).text().to_string().to_lowercase();
+        let query = query.trim().to_string();
+        let has_favorites = !favorite_paths.is_empty();
+        let filtered_paths: Vec<String> = favorite_paths
+            .into_iter()
+            .filter(|path| query.is_empty() || path.to_lowercase().contains(&query))
+            .collect();
+        let disabled = !enabled || !has_favorites;
+
+        Popover::new(popover_id)
+            .open(open)
+            .on_open_change(cx.listener(move |this, open, _window, cx| {
+                match side {
+                    PanelSide::Local => this.local_favorite_popover_open = *open,
+                    PanelSide::Remote => this.remote_favorite_popover_open = *open,
+                }
+                if !*open
+                    && this
+                        .favorite_editing
+                        .as_ref()
+                        .is_some_and(|editing| editing.side == side)
+                {
+                    this.favorite_editing = None;
+                }
+                cx.notify();
+            }))
+            .trigger(
+                Button::new(button_id)
+                    .icon(IconName::FolderOpen)
+                    .ghost()
+                    .small()
+                    .tooltip(t!("FavoritePath.open").to_string())
+                    .disabled(disabled),
+            )
+            .content(move |_state, window, cx| {
+                let mut list = v_flex().gap_1().max_h(px(320.0)).overflow_y_scrollbar();
+                if filtered_paths.is_empty() {
+                    list = list.child(
+                        div()
+                            .px_2()
+                            .py_3()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t!("FavoritePath.no_results").to_string()),
+                    );
+                }
+
+                for path in filtered_paths.iter().cloned() {
+                    let is_editing = editing
+                        .as_ref()
+                        .is_some_and(|state| state.side == side && state.original_path == path);
+                    list = list.child(Self::render_favorite_path_row(
+                        side,
+                        path,
+                        is_editing,
+                        edit_input.clone(),
+                        view.clone(),
+                        window,
+                        cx,
+                    ));
+                }
+
+                v_flex()
+                    .w(px(360.0))
+                    .max_h(px(420.0))
+                    .gap_2()
+                    .p_2()
+                    .child(
+                        Input::new(&search_input)
+                            .small()
+                            .prefix(Icon::new(IconName::Search).small())
+                            .cleanable(true)
+                            .w_full(),
+                    )
+                    .child(list)
+            })
+    }
+
+    fn render_favorite_path_row(
+        side: PanelSide,
+        path: String,
+        is_editing: bool,
+        edit_input: Entity<InputState>,
+        view: Entity<SftpView>,
+        window: &mut Window,
+        cx: &mut Context<PopoverState>,
+    ) -> impl IntoElement {
+        if is_editing {
+            let save_path = path.clone();
+            let cancel_path = path.clone();
+            return h_flex()
+                .id(SharedString::from(format!("favorite-edit-row-{path}")))
+                .gap_1()
+                .items_center()
+                .child(Input::new(&edit_input).small().cleanable(false).flex_1())
+                .child(
+                    Button::new(SharedString::from(format!("favorite-save-{save_path}")))
+                        .icon(IconName::Check)
+                        .ghost()
+                        .small()
+                        .tooltip(t!("FavoritePath.save").to_string())
+                        .on_click(window.listener_for(&view, |this, _, window, cx| {
+                            this.save_editing_favorite_path(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("favorite-cancel-{cancel_path}")))
+                        .icon(IconName::Close)
+                        .ghost()
+                        .small()
+                        .tooltip(t!("FavoritePath.cancel").to_string())
+                        .on_click(window.listener_for(&view, |this, _, _window, cx| {
+                            this.cancel_favorite_path_editing(cx);
+                        })),
+                )
+                .into_any_element();
+        }
+
+        let navigate_path = path.clone();
+        let edit_path = path.clone();
+        let remove_path = path.clone();
+
+        h_flex()
+            .id(SharedString::from(format!("favorite-row-{path}")))
+            .items_center()
+            .gap_1()
+            .h_9()
+            .px_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(cx.theme().border)
+            .hover(|style| style.bg(cx.theme().list_active))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .gap_2()
+                    .items_center()
+                    .px_2()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        window.listener_for(&view, move |this, _, _window, cx| match side {
+                            PanelSide::Local => {
+                                this.navigate_local_to(PathBuf::from(&navigate_path), cx)
+                            }
+                            PanelSide::Remote => this.navigate_remote_to(navigate_path.clone(), cx),
+                        }),
+                    )
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .with_size(Size::Small)
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_sm()
+                            .text_color(cx.theme().foreground)
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .overflow_hidden()
+                            .child(path),
+                    ),
+            )
+            .child(
+                Button::new(SharedString::from(format!("favorite-edit-{edit_path}")))
+                    .icon(IconName::Edit)
+                    .ghost()
+                    .small()
+                    .tooltip(t!("FavoritePath.edit").to_string())
+                    .on_click(window.listener_for(&view, move |this, _, window, cx| {
+                        this.start_favorite_path_editing(side, edit_path.clone(), window, cx);
+                    })),
+            )
+            .child(
+                Button::new(SharedString::from(format!("favorite-remove-{remove_path}")))
+                    .icon(IconName::Remove)
+                    .ghost()
+                    .small()
+                    .tooltip(t!("FavoritePath.delete").to_string())
+                    .on_click(window.listener_for(&view, move |this, _, window, cx| {
+                        this.remove_favorite_path_for_side(side, &remove_path, window, cx);
+                    })),
+            )
+            .into_any_element()
     }
 
     fn start_local_path_editing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1307,6 +2247,47 @@ impl SftpView {
                 });
             })
             .detach();
+    }
+
+    fn paste_upload_from_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(client) = self.sftp_client.clone() else {
+            window.push_notification(
+                Notification::warning("SFTP 未连接，无法上传剪贴板内容".to_string()).autohide(true),
+                cx,
+            );
+            return;
+        };
+
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+
+        let upload_paths = match clipboard_upload_paths(&item) {
+            Ok(upload_paths) => upload_paths.paths,
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("读取剪贴板失败：{error}")).autohide(true),
+                    cx,
+                );
+                return;
+            }
+        };
+
+        if upload_paths.is_empty() {
+            window.push_notification(
+                Notification::info("剪贴板没有可上传的文件或图片".to_string()).autohide(true),
+                cx,
+            );
+            return;
+        }
+
+        self.upload_paths_to_remote(
+            upload_paths,
+            self.remote_current_path.clone(),
+            client,
+            window,
+            cx,
+        );
     }
 
     fn show_conflict_dialog(
@@ -3219,110 +4200,141 @@ impl SftpView {
             )
     }
 
+    fn render_extract_queue_row(
+        &self,
+        extract: ActiveExtract,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tooltip_name = extract.path.clone();
+
+        h_flex()
+            .gap_2()
+            .items_center()
+            .child(Spinner::new().small())
+            .child(Icon::new(IconName::Unarchive).small())
+            .child(
+                div()
+                    .id("extract-name")
+                    .text_sm()
+                    .min_w(px(120.))
+                    .max_w(px(250.))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(extract.name)
+                    .tooltip(move |window, cx| {
+                        Tooltip::new(tooltip_name.clone()).build(window, cx)
+                    }),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .text_xs()
+                    .w(px(90.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t!("Extract.running").to_string()),
+            )
+            .into_any_element()
+    }
+
     fn render_transfer_queue(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_tasks = self.transfer_queue.active_tasks();
 
-        if active_tasks.is_empty() {
+        if active_tasks.is_empty() && self.active_extract.is_none() {
             return div().into_any_element();
         }
 
-        v_flex()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .p_2()
-            .gap_1()
-            .children(active_tasks.into_iter().map(|task| {
-                let is_delete_op = matches!(
-                    &task.operation,
-                    TransferOperation::DeleteRemote { .. } | TransferOperation::DeleteLocal { .. }
-                );
+        let mut rows = Vec::new();
+        for task in active_tasks {
+            let is_delete_op = matches!(
+                &task.operation,
+                TransferOperation::DeleteRemote { .. } | TransferOperation::DeleteLocal { .. }
+            );
 
-                let (icon, label) = match &task.operation {
-                    TransferOperation::Upload { local_path, .. } => (
-                        IconName::ArrowUp,
-                        local_path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default(),
-                    ),
-                    TransferOperation::Download { remote_path, .. } => {
-                        let name = remote_path.rsplit('/').next().unwrap_or(remote_path);
-                        (IconName::ArrowDown, name.to_string())
-                    }
-                    TransferOperation::DeleteRemote { entries, .. } => (
-                        IconName::Remove,
-                        t!("Delete.delete_n_items", count = entries.len()).to_string(),
-                    ),
-                    TransferOperation::DeleteLocal { entries, .. } => (
-                        IconName::Remove,
-                        t!("Delete.delete_n_items", count = entries.len()).to_string(),
-                    ),
-                };
+            let (icon, label) = match &task.operation {
+                TransferOperation::Upload { local_path, .. } => (
+                    IconName::ArrowUp,
+                    local_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                ),
+                TransferOperation::Download { remote_path, .. } => {
+                    let name = remote_path.rsplit('/').next().unwrap_or(remote_path);
+                    (IconName::ArrowDown, name.to_string())
+                }
+                TransferOperation::DeleteRemote { entries, .. } => (
+                    IconName::Remove,
+                    t!("Delete.delete_n_items", count = entries.len()).to_string(),
+                ),
+                TransferOperation::DeleteLocal { entries, .. } => (
+                    IconName::Remove,
+                    t!("Delete.delete_n_items", count = entries.len()).to_string(),
+                ),
+            };
 
-                let transferred = task.shared_progress.transferred.load(Ordering::Relaxed);
-                let total = task.shared_progress.total.load(Ordering::Relaxed);
-                let speed_bits = task.shared_progress.speed.load(Ordering::Relaxed);
-                let speed = f64::from_bits(speed_bits);
-                let is_scanning = task.shared_progress.scanning.load(Ordering::Relaxed);
+            let transferred = task.shared_progress.transferred.load(Ordering::Relaxed);
+            let total = task.shared_progress.total.load(Ordering::Relaxed);
+            let speed_bits = task.shared_progress.speed.load(Ordering::Relaxed);
+            let speed = f64::from_bits(speed_bits);
+            let is_scanning = task.shared_progress.scanning.load(Ordering::Relaxed);
 
-                let current_file = task
-                    .shared_progress
-                    .current_file
-                    .read()
-                    .ok()
-                    .and_then(|g| g.clone());
-                let current_file_transferred = task
-                    .shared_progress
-                    .current_file_transferred
-                    .load(Ordering::Relaxed);
-                let current_file_total = task
-                    .shared_progress
-                    .current_file_total
-                    .load(Ordering::Relaxed);
+            let current_file = task
+                .shared_progress
+                .current_file
+                .read()
+                .ok()
+                .and_then(|g| g.clone());
+            let current_file_transferred = task
+                .shared_progress
+                .current_file_transferred
+                .load(Ordering::Relaxed);
+            let current_file_total = task
+                .shared_progress
+                .current_file_total
+                .load(Ordering::Relaxed);
 
-                let progress_pct = if total > 0 {
-                    (transferred as f64 / total as f64 * 100.0) as u32
-                } else {
-                    0
-                };
+            let progress_pct = if total > 0 {
+                (transferred as f64 / total as f64 * 100.0) as u32
+            } else {
+                0
+            };
 
-                let current_file_pct = if current_file_total > 0 {
-                    (current_file_transferred as f64 / current_file_total as f64 * 100.0) as u32
-                } else {
-                    0
-                };
+            let current_file_pct = if current_file_total > 0 {
+                (current_file_transferred as f64 / current_file_total as f64 * 100.0) as u32
+            } else {
+                0
+            };
 
-                let task_id = task.id;
-                let is_running = task.state == TransferTaskState::Running;
-                let has_current_file = current_file.is_some();
+            let task_id = task.id;
+            let is_running = task.state == TransferTaskState::Running;
+            let has_current_file = current_file.is_some();
 
-                // 对于删除操作，显示当前正在删除的文件名
-                let display_name = if is_delete_op {
-                    if is_scanning {
-                        t!("Delete.scanning").to_string()
-                    } else if let Some(ref file) = current_file {
-                        t!("Delete.deleting", name = file).to_string()
-                    } else {
-                        label.clone()
-                    }
+            let display_name = if is_delete_op {
+                if is_scanning {
+                    t!("Delete.scanning").to_string()
                 } else if let Some(ref file) = current_file {
-                    format!("{} - {}", label, file)
+                    t!("Delete.deleting", name = file).to_string()
                 } else {
                     label.clone()
-                };
-                let tooltip_name = display_name.clone();
+                }
+            } else if let Some(ref file) = current_file {
+                format!("{} - {}", label, file)
+            } else {
+                label.clone()
+            };
+            let tooltip_name = display_name.clone();
 
-                // 对于删除操作，始终使用总体进度
-                let display_progress = if is_scanning {
-                    0
-                } else if is_delete_op {
-                    progress_pct
-                } else if has_current_file {
-                    current_file_pct
-                } else {
-                    progress_pct
-                };
+            let display_progress = if is_scanning {
+                0
+            } else if is_delete_op {
+                progress_pct
+            } else if has_current_file {
+                current_file_pct
+            } else {
+                progress_pct
+            };
 
+            rows.push(
                 h_flex()
                     .gap_2()
                     .items_center()
@@ -3396,7 +4408,20 @@ impl SftpView {
                                 this.cancel_transfer(task_id, cx);
                             })),
                     )
-            }))
+                    .into_any_element(),
+            );
+        }
+
+        if let Some(extract) = self.active_extract.clone() {
+            rows.push(self.render_extract_queue_row(extract, cx));
+        }
+
+        v_flex()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .p_2()
+            .gap_1()
+            .children(rows)
             .into_any_element()
     }
 
@@ -3535,6 +4560,8 @@ impl SftpView {
         let is_dragging = self.is_dragging_over_local;
         let can_go_back = self.can_go_back_local();
         let can_go_forward = self.can_go_forward_local();
+        let is_favorite = self.is_current_local_path_favorite();
+        let favorite_paths = self.local_favorite_paths();
 
         v_flex()
             .flex_1()
@@ -3612,6 +4639,25 @@ impl SftpView {
                         h_flex()
                             .gap_1()
                             .child(
+                                Button::new("local_toggle_favorite")
+                                    .icon(if is_favorite {
+                                        IconName::StarFill
+                                    } else {
+                                        IconName::Star
+                                    })
+                                    .ghost()
+                                    .small()
+                                    .tooltip(if is_favorite {
+                                        t!("FavoritePath.remove_current").to_string()
+                                    } else {
+                                        t!("FavoritePath.add_current").to_string()
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_current_local_favorite(window, cx);
+                                    })),
+                            )
+                            .child(self.render_local_favorites_menu(favorite_paths, cx))
+                            .child(
                                 Button::new("refresh_local")
                                     .icon(IconName::Refresh)
                                     .ghost()
@@ -3684,6 +4730,8 @@ impl SftpView {
         let is_dragging = self.is_dragging_over_remote;
         let can_go_back = self.can_go_back_remote();
         let can_go_forward = self.can_go_forward_remote();
+        let is_favorite = self.is_current_remote_path_favorite();
+        let favorite_paths = self.remote_favorite_paths();
 
         v_flex()
             .flex_1()
@@ -3758,6 +4806,30 @@ impl SftpView {
                     .child(
                         h_flex()
                             .gap_1()
+                            .child(
+                                Button::new("remote_toggle_favorite")
+                                    .icon(if is_favorite {
+                                        IconName::StarFill
+                                    } else {
+                                        IconName::Star
+                                    })
+                                    .ghost()
+                                    .small()
+                                    .tooltip(if is_favorite {
+                                        t!("FavoritePath.remove_current").to_string()
+                                    } else {
+                                        t!("FavoritePath.add_current").to_string()
+                                    })
+                                    .disabled(!is_connected)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_current_remote_favorite(window, cx);
+                                    })),
+                            )
+                            .child(self.render_remote_favorites_menu(
+                                favorite_paths,
+                                is_connected,
+                                cx,
+                            ))
                             .child(
                                 Button::new("refresh_remote")
                                     .icon(IconName::Refresh)
@@ -3908,6 +4980,10 @@ impl TabContent for SftpView {
         true
     }
 
+    fn can_split(&self, _cx: &App) -> bool {
+        true
+    }
+
     fn try_close(
         &mut self,
         _tab_id: &str,
@@ -4036,6 +5112,11 @@ impl Render for SftpView {
         v_flex()
             .size_full()
             .relative()
+            .track_focus(&self.focus_handle)
+            .key_context(SFTP_VIEW_CONTEXT)
+            .on_action(cx.listener(|this, _: &PasteUpload, window, cx| {
+                this.paste_upload_from_clipboard(window, cx);
+            }))
             .bg(cx.theme().background)
             .child(
                 h_flex()
@@ -4071,5 +5152,100 @@ mod tests {
             Path::new("/tmp/b"),
             Path::new("/tmp/a")
         ));
+    }
+
+    #[test]
+    fn archive_kind_detects_supported_remote_archives() {
+        assert_eq!(
+            Some(super::ArchiveKind::Zip),
+            super::archive_kind_for_name("APP.ZIP")
+        );
+        assert_eq!(
+            Some(super::ArchiveKind::TarGz),
+            super::archive_kind_for_name("release.tar.gz")
+        );
+        assert_eq!(
+            Some(super::ArchiveKind::Tgz),
+            super::archive_kind_for_name("release.tgz")
+        );
+        assert_eq!(None, super::archive_kind_for_name("notes.txt"));
+    }
+
+    #[test]
+    fn build_remote_extract_command_quotes_paths_and_uses_archive_parent() {
+        assert_eq!(
+            Some("unzip -o -- '/srv/a'\\''b/app.zip' -d '/srv/a'\\''b'".to_string()),
+            super::build_remote_extract_command(
+                "/srv/a'b/app.zip",
+                "app.zip",
+                super::ExtractConflictAction::Overwrite
+            )
+        );
+        assert_eq!(
+            Some("tar -xzf '/tmp/release.tar.gz' -C '/tmp'".to_string()),
+            super::build_remote_extract_command(
+                "/tmp/release.tar.gz",
+                "release.tar.gz",
+                super::ExtractConflictAction::Overwrite
+            )
+        );
+        assert_eq!(
+            None,
+            super::build_remote_extract_command(
+                "/tmp/readme.md",
+                "readme.md",
+                super::ExtractConflictAction::Overwrite
+            )
+        );
+    }
+
+    #[test]
+    fn build_remote_extract_command_can_skip_existing_targets() {
+        assert_eq!(
+            Some("unzip -n -- '/tmp/app.zip' -d '/tmp'".to_string()),
+            super::build_remote_extract_command(
+                "/tmp/app.zip",
+                "app.zip",
+                super::ExtractConflictAction::SkipExisting
+            )
+        );
+        assert_eq!(
+            Some("tar --skip-old-files -xzf '/tmp/release.tar.gz' -C '/tmp'".to_string()),
+            super::build_remote_extract_command(
+                "/tmp/release.tar.gz",
+                "release.tar.gz",
+                super::ExtractConflictAction::SkipExisting
+            )
+        );
+        assert_eq!(
+            Some("test -e '/tmp/app.log' || gzip -dk -- '/tmp/app.log.gz'".to_string()),
+            super::build_remote_extract_command(
+                "/tmp/app.log.gz",
+                "app.log.gz",
+                super::ExtractConflictAction::SkipExisting
+            )
+        );
+    }
+
+    #[test]
+    fn build_remote_extract_conflict_check_command_detects_existing_targets() {
+        assert_eq!(
+            Some("test -e '/tmp/app.log'".to_string()),
+            super::build_remote_extract_conflict_check_command("/tmp/app.log.gz", "app.log.gz")
+        );
+
+        let zip_command =
+            super::build_remote_extract_conflict_check_command("/srv/a'b/app.zip", "app.zip")
+                .unwrap();
+        assert!(zip_command.contains("parent='/srv/a'\\''b'"));
+        assert!(zip_command.contains("unzip -Z1 -- '/srv/a'\\''b/app.zip'"));
+        assert!(zip_command.contains("[ -e \"$parent/$entry\" ]"));
+
+        let tar_command = super::build_remote_extract_conflict_check_command(
+            "/tmp/release.tar.gz",
+            "release.tar.gz",
+        )
+        .unwrap();
+        assert!(tar_command.contains("tar -tf '/tmp/release.tar.gz'"));
     }
 }

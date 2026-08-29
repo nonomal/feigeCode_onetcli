@@ -5,13 +5,18 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use super::UpdateDialogInfo;
+use super::download::{build_download_path, download_update_file_from_sources, verify_sha256};
+use super::install::start_install_update;
+use super::util::{UpdateInstallAction, format_bytes};
+use crate::update::github_release::GITHUB_LATEST_RELEASE_URL;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, AsyncApp, Context, FocusHandle, Focusable, IntoElement, ParentElement, Render,
     Styled, WeakEntity, Window, div,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, Sizable, TitleBar, WindowExt,
+    ActiveTheme, Disableable, Sizable, WindowExt,
     button::{Button, ButtonVariants as _},
     clipboard::Clipboard,
     h_flex,
@@ -21,11 +26,6 @@ use gpui_component::{
 use one_core::gpui_tokio::Tokio;
 use one_core::popup_window::{PopupWindowOptions, open_popup_window};
 use rust_i18n::t;
-
-use super::UpdateDialogInfo;
-use super::download::{build_download_path, download_update_file, verify_sha256};
-use super::install::start_install_update;
-use super::util::{UpdateInstallAction, format_bytes};
 
 const DOWNLOAD_PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -105,14 +105,15 @@ impl UpdateDialogView {
             return;
         }
 
-        let Some(download_url) = self.info.download_url.clone() else {
+        let download_urls = self.info.download_urls();
+        let Some(download_url) = download_urls.first() else {
             self.error_message = Some(t!("Update.missing_download_url").to_string());
             self.status_message = t!("Update.download_failed").to_string();
             cx.notify();
             return;
         };
 
-        let download_path = match build_download_path(&self.info.latest_version, &download_url) {
+        let download_path = match build_download_path(&self.info.latest_version, download_url) {
             Ok(path) => path,
             Err(err) => {
                 self.error_message = Some(err);
@@ -159,9 +160,9 @@ impl UpdateDialogView {
 
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let download_task = Tokio::spawn(cx, async move {
-                download_update_file(
+                download_update_file_from_sources(
                     http_client,
-                    &download_url,
+                    &download_urls,
                     &download_path_for_task,
                     move |downloaded, total| {
                         if let Ok(mut progress) = progress_state_for_task.lock() {
@@ -172,10 +173,9 @@ impl UpdateDialogView {
                 .await
             });
 
-            let download_result = match download_task.await {
-                Ok(result) => result,
-                Err(err) => Err(format!("下载任务执行失败: {}", err)),
-            };
+            let download_result = download_task
+                .await
+                .unwrap_or_else(|err| Err(format!("下载任务执行失败: {}", err)));
             progress_finished.store(true, Ordering::Relaxed);
 
             match download_result {
@@ -344,24 +344,11 @@ impl Render for UpdateDialogView {
             t!("Update.action_download").to_string()
         };
 
-        let release_page_url = self.info.release_page_url.clone();
+        let release_page_url = GITHUB_LATEST_RELEASE_URL;
 
         v_flex()
             .gap_3()
             .size_full()
-            .bg(cx.theme().background)
-            .child(
-                TitleBar::new().child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .flex_1()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(t!("Update.title").to_string()),
-                ),
-            )
             .child(
                 div().flex_1().p_4().child(
                     v_flex()
@@ -394,41 +381,40 @@ impl Render for UpdateDialogView {
                                 .text_color(cx.theme().muted_foreground)
                                 .child(status_message),
                         )
-                        .when(release_page_url.is_some(), |this| {
-                            let url = release_page_url.clone().unwrap_or_default();
-                            let url_for_open = url.clone();
-                            this.child(
-                                v_flex()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(t!("Update.open_release_page").to_string()),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().link)
-                                                    .child(url.clone()),
-                                            )
-                                            .child(Clipboard::new("release-url-copy").value(url))
-                                            .child(
-                                                Button::new("release-url-open")
-                                                    .xsmall()
-                                                    .ghost()
-                                                    .icon(gpui_component::IconName::ExternalLink)
-                                                    .on_click(move |_, _, cx| {
-                                                        cx.open_url(&url_for_open);
-                                                    }),
-                                            ),
-                                    ),
-                            )
-                        }),
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(t!("Update.open_release_page").to_string()),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().link)
+                                                .child(release_page_url),
+                                        )
+                                        .child(
+                                            Clipboard::new("release-url-copy")
+                                                .value(release_page_url),
+                                        )
+                                        .child(
+                                            Button::new("release-url-open")
+                                                .xsmall()
+                                                .ghost()
+                                                .icon(gpui_component::IconName::ExternalLink)
+                                                .on_click(move |_, _, cx| {
+                                                    cx.open_url(&release_page_url);
+                                                }),
+                                        ),
+                                ),
+                        ),
                 ),
             )
             .child(

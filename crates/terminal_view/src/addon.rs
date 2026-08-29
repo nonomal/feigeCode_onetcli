@@ -10,12 +10,16 @@ use alacritty_terminal::term::search::RegexSearch;
 use gpui::*;
 use gpui_component::try_parse_color;
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use url::Url;
 
 use terminal::pty_backend::GpuiEventProxy;
+
+const CWD_ENTRY_CACHE_TTL: Duration = Duration::from_secs(2);
+const CWD_ENTRY_CACHE_LIMIT: usize = 2_000;
 
 // ============================================================================
 // Decoration System
@@ -924,6 +928,7 @@ impl TerminalAddon for CustomHighlightAddon {
 pub struct FilePathAddon {
     path_regex: Option<regex::Regex>,
     hovered_path: Option<HoveredPath>,
+    cwd_entry_cache: CwdEntryCache,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -934,15 +939,59 @@ pub struct HoveredPath {
     pub col_range: Range<usize>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct CwdEntryCache {
+    base_dir: Option<PathBuf>,
+    entries: HashSet<String>,
+    loaded_at: Option<Instant>,
+}
+
+impl CwdEntryCache {
+    fn contains(&mut self, base_dir: &Path, name: &str) -> bool {
+        if self.should_refresh(base_dir) {
+            self.refresh(base_dir);
+        }
+        self.entries.contains(name)
+    }
+
+    fn should_refresh(&self, base_dir: &Path) -> bool {
+        if self.base_dir.as_deref() != Some(base_dir) {
+            return true;
+        }
+        self.loaded_at
+            .is_none_or(|loaded_at| loaded_at.elapsed() > CWD_ENTRY_CACHE_TTL)
+    }
+
+    fn refresh(&mut self, base_dir: &Path) {
+        let mut next = HashSet::new();
+        if let Ok(entries) = std::fs::read_dir(base_dir) {
+            for (index, entry) in entries.flatten().enumerate() {
+                if index >= CWD_ENTRY_CACHE_LIMIT {
+                    next.clear();
+                    break;
+                }
+                if let Ok(name) = entry.file_name().into_string() {
+                    next.insert(name);
+                }
+            }
+        }
+        self.base_dir = Some(base_dir.to_path_buf());
+        self.entries = next;
+        self.loaded_at = Some(Instant::now());
+    }
+}
+
 impl FilePathAddon {
     pub fn new() -> Self {
         let path_regex = regex::Regex::new(
             r#"(?x)
             (?P<path>
-                (?:~|\.{1,2})/[^\s:<>"'|]+|
-                /[^\s:<>"'|]+|
+                (?:~|\.{1,2})/[^\s:<>"'|，。；、]+|
+                /[^\s:<>"'|，。；、]+|
                 [A-Za-z]:\\[^\s:<>"'|]+|
-                \\\\[^\s:<>"'|]+
+                \\\\[^\s:<>"'|]+|
+                (?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-][^\s:<>"'|，。；、]*|
+                [A-Za-z0-9_.-]+\.[A-Za-z0-9][A-Za-z0-9_.-]*
             )
             (?::\d+)?(?::\d+)?
             "#,
@@ -956,6 +1005,7 @@ impl FilePathAddon {
         Self {
             path_regex,
             hovered_path: None,
+            cwd_entry_cache: CwdEntryCache::default(),
         }
     }
 
@@ -980,41 +1030,86 @@ impl FilePathAddon {
             return false;
         }
 
-        let path_regex = match self.path_regex.as_ref() {
-            Some(regex) => regex,
-            None => return false,
-        };
-
-        for mat in path_regex.find_iter(line_text) {
-            let start_col = line_text[..mat.start()].chars().count();
-            let end_col = line_text[..mat.end()].chars().count();
-
-            if column < start_col || column >= end_col {
-                continue;
-            }
-
-            let candidate = mat.as_str();
-            if candidate.starts_with("file://") {
-                continue;
-            }
-
-            let (path_part, _line_number, _column_number) = split_path_line_column(candidate);
-            let cleaned_path = trim_trailing_punctuation(&path_part);
-
-            if let Some(resolved_path) = resolve_path(&cleaned_path, base_dir) {
-                if resolved_path.exists() {
-                    self.hovered_path = Some(HoveredPath {
-                        display: candidate.to_string(),
-                        path: resolved_path,
-                        line: screen_line,
-                        col_range: start_col..end_col,
-                    });
+        if let Some(path_regex) = self.path_regex.clone() {
+            for mat in path_regex.find_iter(line_text) {
+                if self.detect_regex_path_match(mat, line_text, column, screen_line, base_dir) {
                     return true;
                 }
             }
         }
 
-        false
+        self.detect_cwd_entry_at(line_text, column, screen_line, base_dir)
+    }
+
+    fn detect_regex_path_match(
+        &mut self,
+        mat: regex::Match<'_>,
+        line_text: &str,
+        column: usize,
+        screen_line: usize,
+        base_dir: Option<&Path>,
+    ) -> bool {
+        let start_col = line_text[..mat.start()].chars().count();
+        let end_col = line_text[..mat.end()].chars().count();
+        if column < start_col || column >= end_col {
+            return false;
+        }
+
+        let candidate = mat.as_str();
+        if candidate.starts_with("file://") {
+            return false;
+        }
+
+        let (path_part, _line_number, _column_number) = split_path_line_column(candidate);
+        let cleaned_path = trim_trailing_punctuation(&path_part);
+        let path_end_col = start_col + cleaned_path.chars().count();
+        if column >= path_end_col {
+            return false;
+        }
+
+        self.set_hovered_if_exists(cleaned_path, screen_line, start_col..path_end_col, base_dir)
+    }
+
+    fn detect_cwd_entry_at(
+        &mut self,
+        line_text: &str,
+        column: usize,
+        screen_line: usize,
+        base_dir: Option<&Path>,
+    ) -> bool {
+        let Some(base_dir) = base_dir else {
+            return false;
+        };
+        let Some((candidate, col_range)) = cwd_entry_token_at(line_text, column) else {
+            return false;
+        };
+        if !self.cwd_entry_cache.contains(base_dir, &candidate) {
+            return false;
+        }
+
+        self.set_hovered_if_exists(candidate, screen_line, col_range, Some(base_dir))
+    }
+
+    fn set_hovered_if_exists(
+        &mut self,
+        display: String,
+        screen_line: usize,
+        col_range: Range<usize>,
+        base_dir: Option<&Path>,
+    ) -> bool {
+        let Some(resolved_path) = resolve_path(&display, base_dir) else {
+            return false;
+        };
+        if !resolved_path.exists() {
+            return false;
+        }
+        self.hovered_path = Some(HoveredPath {
+            display,
+            path: resolved_path,
+            line: screen_line,
+            col_range,
+        });
+        true
     }
 }
 
@@ -1166,6 +1261,60 @@ fn trim_trailing_punctuation(candidate: &str) -> String {
     trimmed.to_string()
 }
 
+fn cwd_entry_token_at(line_text: &str, column: usize) -> Option<(String, Range<usize>)> {
+    let chars = line_text.char_indices().collect::<Vec<_>>();
+    let (_, char_at_column) = chars.get(column)?;
+    if !is_cwd_entry_token_char(*char_at_column) {
+        return None;
+    }
+
+    let mut start = column;
+    while start > 0 && is_cwd_entry_token_char(chars[start - 1].1) {
+        start -= 1;
+    }
+
+    let mut end = column + 1;
+    while end < chars.len() && is_cwd_entry_token_char(chars[end].1) {
+        end += 1;
+    }
+
+    let start_byte = chars[start].0;
+    let end_byte = chars
+        .get(end)
+        .map(|(byte, _)| *byte)
+        .unwrap_or(line_text.len());
+    let cleaned = trim_trailing_punctuation(&line_text[start_byte..end_byte]);
+    let cleaned_end = start + cleaned.chars().count();
+    if cleaned.is_empty() || column >= cleaned_end {
+        return None;
+    }
+    Some((cleaned, start..cleaned_end))
+}
+
+fn is_cwd_entry_token_char(char: char) -> bool {
+    !char.is_whitespace()
+        && !matches!(
+            char,
+            ':' | '<'
+                | '>'
+                | '"'
+                | '\''
+                | '|'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | ','
+                | ';'
+                | '，'
+                | '。'
+                | '；'
+                | '、'
+        )
+}
+
 fn resolve_path(raw_path: &str, base_dir: Option<&Path>) -> Option<PathBuf> {
     if raw_path.is_empty() {
         return None;
@@ -1222,8 +1371,21 @@ fn file_path_to_url(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AddonManager, compile_custom_highlight_rules, register_default_addons};
+    use super::{
+        AddonManager, FilePathAddon, compile_custom_highlight_rules, register_default_addons,
+    };
     use crate::settings::TerminalHighlightRule;
+    use std::fs;
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("onetcli-{name}-{timestamp}"))
+    }
 
     #[test]
     fn custom_highlight_rule_requires_pattern_and_color() {
@@ -1265,5 +1427,112 @@ mod tests {
 
         assert!(manager.is_loaded("custom_highlights"));
         assert!(!manager.is_loaded("ip_highlight"));
+    }
+
+    #[test]
+    fn file_path_hover_does_not_extend_into_line_number_suffix() {
+        let dir = unique_temp_dir("path-line-suffix");
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let file = dir.join("row.rs");
+        fs::write(&file, "").expect("temp file should be created");
+        let line = format!("见 {}:22 后续", file.display());
+        let path_column = char_column(&line, line.find("row.rs").expect("path should be present"));
+        let line_number_column =
+            char_column(&line, line.find(":22").expect("line should be present")) + 1;
+        let mut addon = FilePathAddon::new();
+
+        assert!(addon.detect_path_at(&line, path_column, 0, None));
+        assert_eq!(file, addon.hovered_path().expect("path should hover").path);
+        assert!(!addon.detect_path_at(&line, line_number_column, 0, None));
+
+        _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn file_path_hover_resolves_bare_relative_paths_from_base_dir() {
+        let dir = unique_temp_dir("relative-path");
+        let file = dir.join("crates/extension-protocol/src/row.rs");
+        fs::create_dir_all(file.parent().expect("file should have parent"))
+            .expect("parent dir should be created");
+        fs::write(&file, "").expect("temp file should be created");
+        let line = "见 crates/extension-protocol/src/row.rs:22";
+        let column = char_column(line, line.find("row.rs").expect("path should be present"));
+        let mut addon = FilePathAddon::new();
+
+        assert!(addon.detect_path_at(line, column, 0, Some(Path::new(&dir))));
+        assert_eq!(file, addon.hovered_path().expect("path should hover").path);
+
+        _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn file_path_hover_resolves_relative_file_name_from_base_dir() {
+        let dir = unique_temp_dir("relative-file-name");
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let file = dir.join("comi-biz-api-test-doc.md");
+        fs::write(&file, "").expect("temp file should be created");
+        let line = "Added  comi-biz-api-test-doc.md (+610 -0)";
+        let column = char_column(line, line.find("comi-biz").expect("path should be present"));
+        let mut addon = FilePathAddon::new();
+
+        assert!(addon.detect_path_at(line, column, 0, Some(Path::new(&dir))));
+        assert_eq!(file, addon.hovered_path().expect("path should hover").path);
+
+        _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn file_path_hover_resolves_cwd_entry_without_extension_from_base_dir() {
+        let dir = unique_temp_dir("cwd-entry-file");
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let file = dir.join("Makefile");
+        fs::write(&file, "").expect("temp file should be created");
+        let line = "Added  Makefile (+12 -0)";
+        let column = char_column(line, line.find("Makefile").expect("path should be present"));
+        let mut addon = FilePathAddon::new();
+
+        assert!(addon.detect_path_at(line, column, 0, Some(Path::new(&dir))));
+        assert_eq!(file, addon.hovered_path().expect("path should hover").path);
+
+        _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn file_path_hover_resolves_cwd_directory_entry_from_base_dir() {
+        let dir = unique_temp_dir("cwd-entry-dir");
+        let child_dir = dir.join("src");
+        fs::create_dir_all(&child_dir).expect("child dir should be created");
+        let line = "Added  src (+0 -0)";
+        let column = char_column(line, line.find("src").expect("path should be present"));
+        let mut addon = FilePathAddon::new();
+
+        assert!(addon.detect_path_at(line, column, 0, Some(Path::new(&dir))));
+        assert_eq!(
+            child_dir,
+            addon.hovered_path().expect("path should hover").path
+        );
+
+        _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn file_path_hover_ignores_plain_word_missing_from_base_dir() {
+        let dir = unique_temp_dir("cwd-entry-missing");
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let line = "Added  Generated (+1 -0)";
+        let column = char_column(
+            line,
+            line.find("Generated").expect("word should be present"),
+        );
+        let mut addon = FilePathAddon::new();
+
+        assert!(!addon.detect_path_at(line, column, 0, Some(Path::new(&dir))));
+        assert!(addon.hovered_path().is_none());
+
+        _ = fs::remove_dir_all(dir);
+    }
+
+    fn char_column(text: &str, byte_index: usize) -> usize {
+        text[..byte_index].chars().count()
     }
 }

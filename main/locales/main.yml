@@ -46,6 +46,90 @@ Common:
     en: Next
     zh-CN: 下一步
     zh-HK: 下一步
+  previous:
+    en: Previous
+    zh-CN: 上一步
+    zh-HK: 上一步
+  none:
+    en: None
+    zh-CN: 无
+    zh-HK: 無
+
+# 项目归档迁移公告
+ArchiveNotice:
+  title:
+    en: OnetCli is no longer maintained
+    zh-CN: OnetCli 已停止维护
+    zh-HK: OnetCli 已停止維護
+  badge:
+    en: Project archived
+    zh-CN: 项目已归档
+    zh-HK: 專案已封存
+  message:
+    en: OnetCli has been archived and will no longer receive feature updates, bug fixes, or new releases. Ongoing development has moved to Navop. You can continue using this version, or visit Navop for future updates.
+    zh-CN: OnetCli 项目已经归档，今后将不再提供功能更新、问题修复或新版本发布。后续开发已迁移至 Navop。你可以继续使用当前版本，或前往 Navop 获取后续更新。
+    zh-HK: OnetCli 專案已經封存，今後將不再提供功能更新、問題修復或新版本發佈。後續開發已遷移至 Navop。你可以繼續使用目前版本，或前往 Navop 取得後續更新。
+  navop_description:
+    en: The actively maintained successor to OnetCli.
+    zh-CN: OnetCli 的后续项目，正在持续维护和更新。
+    zh-HK: OnetCli 的後續專案，正在持續維護和更新。
+  continue_action:
+    en: Continue with OnetCli
+    zh-CN: 继续使用 OnetCli
+    zh-HK: 繼續使用 OnetCli
+  github_action:
+    en: View GitHub
+    zh-CN: 查看 GitHub
+    zh-HK: 查看 GitHub
+  website_action:
+    en: Visit Navop Website
+    zh-CN: 访问 Navop 官网
+    zh-HK: 前往 Navop 官網
+
+# 应用退出
+Quit:
+  confirm_title:
+    en: Quit application?
+    zh-CN: 退出应用？
+    zh-HK: 結束應用程式？
+  confirm_message:
+    en: All tabs will be closed. Some tabs may ask for additional confirmation before quitting.
+    zh-CN: 将关闭所有标签页，部分标签页可能会在退出前要求再次确认。
+    zh-HK: 將關閉所有標籤頁，部分標籤頁可能會在結束前要求再次確認。
+  confirm_action:
+    en: Quit
+    zh-CN: 退出
+    zh-HK: 結束
+
+# MCP 审批
+McpApproval:
+  dialog_title:
+    en: MCP Approval
+    zh-CN: MCP 审批
+    zh-HK: MCP 審批
+  approve:
+    en: Approve
+    zh-CN: 允许
+    zh-HK: 允許
+  deny:
+    en: Deny
+    zh-CN: 拒绝
+    zh-HK: 拒絕
+  pending_count:
+    en: "%{count} more requests waiting"
+    zh-CN: "还有 %{count} 个请求等待审批"
+    zh-HK: "還有 %{count} 個請求等待審批"
+
+# ACP 审批
+AcpApproval:
+  dialog_title:
+    en: ACP Permission
+    zh-CN: ACP 权限请求
+    zh-HK: ACP 權限請求
+  pending_count:
+    en: "%{count} more requests waiting"
+    zh-CN: "还有 %{count} 个请求等待处理"
+    zh-HK: "還有 %{count} 個請求等待處理"
 
 # 首页
 Home:
@@ -61,6 +145,22 @@ Home:
     en: New Connection
     zh-CN: 新建连接
     zh-HK: 新建連線
+  local_terminal_invalid_config:
+    en: "Invalid local terminal configuration: %{error}"
+    zh-CN: "本地终端配置无效：%{error}"
+    zh-HK: "本機終端設定無效：%{error}"
+  port_forwarding_started:
+    en: "Port Forwarding %{name} started on %{addr}"
+    zh-CN: "端口转发 %{name} 已启动：%{addr}"
+    zh-HK: "端口轉發 %{name} 已啟動：%{addr}"
+  port_forwarding_failed:
+    en: "Port Forwarding %{name} failed: %{error}"
+    zh-CN: "端口转发 %{name} 启动失败：%{error}"
+    zh-HK: "端口轉發 %{name} 啟動失敗：%{error}"
+  port_forwarding_missing_ssh:
+    en: Referenced SSH server was not found.
+    zh-CN: 找不到引用的 SSH 服务器。
+    zh-HK: 找不到引用的 SSH 伺服器。
   connection_count:
     en: "%{count} connections"
     zh-CN: "%{count} 个连接"
@@ -77,6 +177,18 @@ Home:
     en: Import
     zh-CN: 导入
     zh-HK: 導入
+  other_app_import:
+    en: Import from other apps
+    zh-CN: 从其他应用导入
+    zh-HK: 從其他應用導入
+  card_view:
+    en: Card View
+    zh-CN: 卡片视图
+    zh-HK: 卡片視圖
+  list_view:
+    en: List View
+    zh-CN: 列表视图
+    zh-HK: 列表視圖
   refresh:
     en: Refresh
     zh-CN: 刷新
@@ -113,10 +225,78 @@ Home:
     en: Sync data with cloud
     zh-CN: 与云端同步数据
     zh-HK: 與雲端同步數據
+  mcp_enable:
+    en: MCP
+    zh-CN: MCP
+    zh-HK: MCP
+  mcp_disable:
+    en: MCP
+    zh-CN: MCP
+    zh-HK: MCP
+  mcp_enable_tooltip:
+    en: Enable MCP server
+    zh-CN: 启用 MCP Server
+    zh-HK: 啟用 MCP Server
+  mcp_disable_tooltip:
+    en: Disable MCP server
+    zh-CN: 关闭 MCP Server
+    zh-HK: 關閉 MCP Server
+  mcp_enabled_notification:
+    en: MCP server enabled
+    zh-CN: MCP Server 已启用
+    zh-HK: MCP Server 已啟用
+  mcp_disabled_notification:
+    en: MCP server disabled
+    zh-CN: MCP Server 已关闭
+    zh-HK: MCP Server 已關閉
   conflict_tooltip:
     en: "%{count} sync conflicts need to be resolved"
     zh-CN: "%{count} 个同步冲突需要解决"
     zh-HK: "%{count} 個同步衝突需要解決"
+  personal_sync_conflict_tooltip:
+    en: "%{count} personal sync conflicts need to be resolved"
+    zh-CN: "%{count} 个个人同步冲突需要解决"
+    zh-HK: "%{count} 個個人同步衝突需要解決"
+  personal_sync_conflict_dialog_title:
+    en: "Personal sync conflicts (%{count})"
+    zh-CN: "个人同步冲突（%{count} 个）"
+    zh-HK: "個人同步衝突（%{count} 個）"
+  personal_sync_conflict_type:
+    en: "Conflict type: %{conflict_type}"
+    zh-CN: "冲突类型: %{conflict_type}"
+    zh-HK: "衝突類型: %{conflict_type}"
+  personal_sync_conflict_use_remote:
+    en: Use remote version
+    zh-CN: 使用远端版本
+    zh-HK: 使用遠端版本
+  personal_sync_conflict_use_local:
+    en: Use local version
+    zh-CN: 使用本地版本
+    zh-HK: 使用本地版本
+  personal_sync_conflict_apply:
+    en: Apply
+    zh-CN: 应用
+    zh-HK: 套用
+  personal_sync_conflict_connection:
+    en: Connection
+    zh-CN: 连接
+    zh-HK: 連線
+  personal_sync_conflict_workspace:
+    en: Workspace
+    zh-CN: 工作区
+    zh-HK: 工作區
+  personal_sync_conflict_both_modified:
+    en: Local and remote both changed
+    zh-CN: 本地和远端都有修改
+    zh-HK: 本地和遠端都有修改
+  personal_sync_conflict_local_deleted_remote_modified:
+    en: Local deleted, remote changed
+    zh-CN: 本地已删除，远端有更新
+    zh-HK: 本地已刪除，遠端有更新
+  personal_sync_conflict_local_modified_remote_deleted:
+    en: Local changed, remote deleted
+    zh-CN: 本地有更新，远端已删除
+    zh-HK: 本地有更新，遠端已刪除
   sync_conflict_type:
     en: "Conflict type: %{conflict_type}"
     zh-CN: "冲突类型: %{conflict_type}"
@@ -137,6 +317,14 @@ Home:
     en: Use local version
     zh-CN: 使用本地版本
     zh-HK: 使用本地版本
+  sync_conflict_keep_both:
+    en: Keep both versions
+    zh-CN: 保留两个版本
+    zh-HK: 保留兩個版本
+  sync_conflict_apply:
+    en: Apply
+    zh-CN: 应用
+    zh-HK: 套用
   ai_assistant:
     en: AI Assistant
     zh-CN: AI 助手
@@ -145,6 +333,14 @@ Home:
     en: Open SFTP
     zh-CN: 打开 SFTP
     zh-HK: 打開 SFTP
+  open_connection:
+    en: Open Connection
+    zh-CN: 打开连接
+    zh-HK: 開啟連線
+  extensions:
+    en: Extensions
+    zh-CN: 扩展
+    zh-HK: 擴展
   edit_connection:
     en: Edit Connection
     zh-CN: 编辑连接
@@ -161,25 +357,163 @@ Home:
     en: Team
     zh-CN: 团队
     zh-HK: 團隊
+  duplicate_name:
+    en: "%{name} (Copy)"
+    zh-CN: "%{name} (副本)"
+    zh-HK: "%{name} (副本)"
+  duplicate_name_numbered:
+    en: "%{name} (Copy %{index})"
+    zh-CN: "%{name} (副本 %{index})"
+    zh-HK: "%{name} (副本 %{index})"
+
+TeamManagement:
+  title:
+    en: Team
+    zh-CN: 团队
+    zh-HK: 團隊
 
 # 团队同步
 TeamSync:
-  personal:
-    en: Personal
-    zh-CN: 个人
-    zh-HK: 個人
   select_team:
     en: Team
     zh-CN: 团队
     zh-HK: 團隊
-  team_label:
-    en: Team
-    zh-CN: 团队归属
-    zh-HK: 團隊歸屬
   no_permission:
     en: No edit permission
     zh-CN: 无编辑权限
     zh-HK: 無編輯權限
+  manage_keys:
+    en: Team keys
+    zh-CN: 团队密钥
+    zh-HK: 團隊密鑰
+  refresh_teams:
+    en: Refresh teams
+    zh-CN: 刷新团队列表
+    zh-HK: 重新整理團隊列表
+  refresh_started:
+    en: Refreshing team list...
+    zh-CN: 正在刷新团队列表...
+    zh-HK: 正在重新整理團隊列表...
+  refresh_success:
+    en: Team list refreshed. %{count} teams cached.
+    zh-CN: 团队列表已刷新，已缓存 %{count} 个团队。
+    zh-HK: 團隊列表已重新整理，已快取 %{count} 個團隊。
+  initialize_started:
+    en: Initializing team key...
+    zh-CN: 正在初始化团队密钥...
+    zh-HK: 正在初始化團隊密鑰...
+  initialize_success:
+    en: Team key initialized and saved locally
+    zh-CN: 团队密钥已初始化，并已保存到本机
+    zh-HK: 團隊密鑰已初始化，並已保存到本機
+  initialize_requires_manager:
+    en: This team has no key verification data. Ask an owner or admin to initialize the team key.
+    zh-CN: 该团队尚未初始化密钥验证数据，请让 owner 或 admin 初始化团队密钥。
+    zh-HK: 該團隊尚未初始化密鑰驗證資料，請讓 owner 或 admin 初始化團隊密鑰。
+  key_label:
+    en: Team key
+    zh-CN: 团队密钥
+    zh-HK: 團隊密鑰
+  new_key_label:
+    en: New key
+    zh-CN: 新密钥
+    zh-HK: 新密鑰
+  new_key_placeholder:
+    en: Optional, fill to rotate and re-encrypt
+    zh-CN: 可选，填写后轮换并批量重加密
+    zh-HK: 可選，填寫後輪換並批量重加密
+  key_placeholder:
+    en: Enter the team key
+    zh-CN: 输入团队密钥
+    zh-HK: 輸入團隊密鑰
+  key_help:
+    en: The key is verified locally and saved encrypted on this device only.
+    zh-CN: 密钥只在本机校验，并加密保存到本机。
+    zh-HK: 密鑰只在本機校驗，並加密保存到本機。
+  rotate_help:
+    en: Fill the new key to rotate the team key and re-encrypt all team sync records.
+    zh-CN: 填写新密钥会轮换团队密钥，并批量重加密该团队的所有同步数据。
+    zh-HK: 填寫新密鑰會輪換團隊密鑰，並批量重加密該團隊的所有同步資料。
+  key_empty:
+    en: Please enter the team key
+    zh-CN: 请输入团队密钥
+    zh-HK: 請輸入團隊密鑰
+  new_key_same:
+    en: New team key must be different from the current key
+    zh-CN: 新团队密钥不能和当前密钥相同
+    zh-HK: 新團隊密鑰不能和目前密鑰相同
+  select_team_required:
+    en: Please select a team
+    zh-CN: 请选择团队
+    zh-HK: 請選擇團隊
+  no_teams:
+    en: No cached teams. Create or join a team, then refresh the team list.
+    zh-CN: 暂无已缓存团队。创建或加入团队后，请刷新团队列表。
+    zh-HK: 暫無已快取團隊。建立或加入團隊後，請重新整理團隊列表。
+  page_desc:
+    en: Manage local keys for each team you joined or administer. Team keys are encrypted and stored only on this device.
+    zh-CN: 管理你加入或管理的各个团队的本地密钥。团队密钥只会加密保存在本机。
+    zh-HK: 管理你加入或管理的各個團隊的本地密鑰。團隊密鑰只會加密保存在本機。
+  empty_title:
+    en: No cached teams
+    zh-CN: 暂无已缓存团队
+    zh-HK: 暫無已快取團隊
+  save_local_key:
+    en: Save key
+    zh-CN: 录入密钥
+    zh-HK: 錄入密鑰
+  forget_local_key:
+    en: Forget
+    zh-CN: 忘记密钥
+    zh-HK: 忘記密鑰
+  rotate_key:
+    en: Rotate
+    zh-CN: 轮换密钥
+    zh-HK: 輪換密鑰
+  rotate_key_empty:
+    en: Please enter both the current key and the new key
+    zh-CN: 请输入当前密钥和新密钥
+    zh-HK: 請輸入目前密鑰和新密鑰
+  rotate_started:
+    en: Rotating team key...
+    zh-CN: 正在轮换团队密钥...
+    zh-HK: 正在輪換團隊密鑰...
+  rotate_success:
+    en: Team key rotated. Re-encrypted %{count} records, version %{version}.
+    zh-CN: 团队密钥轮换完成，已重加密 %{count} 条数据，版本 %{version}。
+    zh-HK: 團隊密鑰輪換完成，已重加密 %{count} 條資料，版本 %{version}。
+  save_success:
+    en: Team key saved locally
+    zh-CN: 团队密钥已保存到本机
+    zh-HK: 團隊密鑰已保存到本機
+  forget_success:
+    en: Local team key forgotten
+    zh-CN: 已忘记本地团队密钥
+    zh-HK: 已忘記本地團隊密鑰
+  status_missing:
+    en: Missing local key
+    zh-CN: 未录入本地密钥
+    zh-HK: 未錄入本地密鑰
+  status_cached:
+    en: Saved locally
+    zh-CN: 已保存到本机
+    zh-HK: 已保存到本機
+  status_unlocked:
+    en: Unlocked
+    zh-CN: 已解锁
+    zh-HK: 已解鎖
+  status_version_mismatch:
+    en: Version changed
+    zh-CN: 版本已变更
+    zh-HK: 版本已變更
+  version:
+    en: Version
+    zh-CN: 版本
+    zh-HK: 版本
+  role:
+    en: Role
+    zh-CN: 角色
+    zh-HK: 角色
 
 # 用户认证
 Auth:
@@ -413,6 +747,10 @@ Workspace:
     en: Workspace name
     zh-CN: 工作区名称
     zh-HK: 工作區名稱
+  sort_order:
+    en: Sort order
+    zh-CN: 排序值
+    zh-HK: 排序值
   new:
     en: New Workspace
     zh-CN: 新建工作区
@@ -485,6 +823,98 @@ Connection:
     zh-CN: "连接 \"%{conn_name}\" 正在使用中，删除前需要先关闭该连接。\n\n请先关闭该连接后再进行删除。"
     zh-HK: "連線 \"%{conn_name}\" 正在使用中，刪除前需要先關閉該連線。\n\n請先關閉該連線後再進行刪除。"
 
+# 新建连接
+NewConnection:
+  category_all:
+    en: All
+    zh-CN: 全部
+    zh-HK: 全部
+  category_database:
+    en: Database
+    zh-CN: 数据库
+    zh-HK: 資料庫
+  category_domestic_database:
+    en: Domestic Database
+    zh-CN: 国产数据库
+    zh-HK: 國產資料庫
+  category_terminal:
+    en: Terminal
+    zh-CN: 终端
+    zh-HK: 終端
+  select_type_title:
+    en: Select connection type
+    zh-CN: 选择连接类型
+    zh-HK: 選擇連線類型
+  select_type_hint:
+    en: Select a type, then click Next, or double-click to open the connection form.
+    zh-CN: 单击选择后点击下一步，或双击直接进入连接表单。
+    zh-HK: 單擊選擇後點擊下一步，或雙擊直接進入連線表單。
+  more_connections:
+    en: "More Connections"
+    zh-CN: "更多连接"
+    zh-HK: "更多連線"
+  description_ssh:
+    en: Remote server terminal and file connection
+    zh-CN: 远程服务器终端与文件连接
+    zh-HK: 遠端伺服器終端與檔案連線
+  description_terminal:
+    en: Open a local terminal tab
+    zh-CN: 打开一个本地终端标签页
+    zh-HK: 開啟一個本機終端標籤頁
+  description_rdp:
+    en: Remote Desktop Protocol connection
+    zh-CN: 远程桌面协议连接
+    zh-HK: 遠端桌面協議連線
+  description_vnc:
+    en: Virtual Network Computing connection
+    zh-CN: VNC 远程桌面连接
+    zh-HK: VNC 遠端桌面連線
+  description_redis:
+    en: Redis standalone, sentinel, or cluster connection
+    zh-CN: Redis 单机、哨兵或集群连接
+    zh-HK: Redis 單機、哨兵或叢集連線
+  description_mongodb:
+    en: MongoDB database connection
+    zh-CN: MongoDB 数据库连接
+    zh-HK: MongoDB 資料庫連線
+  description_serial:
+    en: Serial device connection
+    zh-CN: 串口设备连接
+    zh-HK: 串口裝置連線
+  description_port_forwarding:
+    en: SSH local port forwarding or SOCKS tunnel
+    zh-CN: SSH 本地端口转发或 SOCKS 隧道
+    zh-HK: SSH 本地端口轉發或 SOCKS 隧道
+  description_more_connections:
+    en: Find more connection drivers in Extensions
+    zh-CN: 前往扩展市场发现更多连接类型
+    zh-HK: 前往擴展市場探索更多連線類型
+  description_database:
+    en: Relational database connection
+    zh-CN: 关系型数据库连接
+    zh-HK: 關聯式資料庫連線
+
+PortForwarding:
+  new:
+    en: Port Forwarding
+    zh-CN: 端口转发
+    zh-HK: 端口轉發
+  edit:
+    en: Edit Port Forwarding
+    zh-CN: 编辑端口转发
+    zh-HK: 編輯端口轉發
+
+# 连接表单通用字段
+ConnectionForm:
+  cloud_sync:
+    en: Cloud Sync
+    zh-CN: 云端同步
+    zh-HK: 雲端同步
+  cloud_sync_desc:
+    en: Sync this connection across devices
+    zh-CN: 在多设备间同步此连接
+    zh-HK: 在多設備間同步此連線
+
 # 设置页面
 Settings:
   title:
@@ -513,6 +943,10 @@ Settings:
         en: Switch the interface display language, some content requires restarting the application to take effect
         zh-CN: 切换界面显示语言，部分内容需要重启应用后生效
         zh-HK: 切換介面顯示語言，部分內容需要重啟應用後生效
+      system:
+        en: Follow System
+        zh-CN: 跟随系统
+        zh-HK: 跟隨系統
       zh_cn:
         en: Simplified Chinese
         zh-CN: 简体中文
@@ -525,6 +959,29 @@ Settings:
         en: English
         zh-CN: English
         zh-HK: English
+
+    # 启动设置
+    Startup:
+      group_title:
+        en: Startup
+        zh-CN: 启动
+        zh-HK: 啟動
+      default_page:
+        en: Default Startup Page
+        zh-CN: 默认启动页
+        zh-HK: 預設啟動頁
+      default_page_desc:
+        en: Select which fixed tab is active when the application opens
+        zh-CN: 选择应用启动时默认激活的固定标签页
+        zh-HK: 選擇應用程式啟動時預設啟用的固定標籤頁
+      default_page_home:
+        en: Home
+        zh-CN: 首页
+        zh-HK: 首頁
+      default_page_ai_workbench:
+        en: AI Workbench
+        zh-CN: AI 工作台
+        zh-HK: AI 工作台
 
     # 外观设置
     Appearance:
@@ -563,6 +1020,62 @@ Settings:
         en: Select the application font family
         zh-CN: 选择应用的字体系列
         zh-HK: 選擇應用的字型系列
+      sql_editor_font_family:
+        en: SQL Editor Font
+        zh-CN: SQL 编辑器字体
+        zh-HK: SQL 編輯器字型
+      sql_editor_font_family_desc:
+        en: Select the monospace font used by the SQL editor
+        zh-CN: 选择 SQL 编辑器使用的等宽字体
+        zh-HK: 選擇 SQL 編輯器使用的等寬字型
+      table_preview_font_family:
+        en: Table Preview Font
+        zh-CN: 表预览字体
+        zh-HK: 表預覽字型
+      table_preview_font_family_desc:
+        en: Select the monospace font used by table previews
+        zh-CN: 选择表预览使用的等宽字体
+        zh-HK: 選擇表預覽使用的等寬字型
+      terminal_font_family:
+        en: Terminal Font
+        zh-CN: 终端字体
+        zh-HK: 終端字型
+      terminal_font_family_desc:
+        en: Select the monospace font used by terminals
+        zh-CN: 选择终端使用的等宽字体
+        zh-HK: 選擇終端使用的等寬字型
+      custom_fonts:
+        en: Custom Fonts
+        zh-CN: 自定义字体
+        zh-HK: 自訂字型
+      custom_fonts_desc:
+        en: Import local .ttf, .otf, .ttc, or .otc font files for the application text renderer. Select the font family above after importing.
+        zh-CN: 导入本地 .ttf、.otf、.ttc 或 .otc 字体文件供应用文本渲染使用。导入后在上方选择对应字体系列。
+        zh-HK: 匯入本機 .ttf、.otf、.ttc 或 .otc 字型檔供應用程式文字渲染使用。匯入後在上方選擇對應字型系列。
+      import_custom_fonts:
+        en: Import Fonts
+        zh-CN: 导入字体
+        zh-HK: 匯入字型
+      select_font_files:
+        en: Select font files
+        zh-CN: 选择字体文件
+        zh-HK: 選擇字型檔
+      unsupported_font_file:
+        en: Unsupported font file
+        zh-CN: 不支持的字体文件
+        zh-HK: 不支援的字型檔
+      custom_fonts_import_success:
+        en: "Imported %{count} font file(s)"
+        zh-CN: "已导入 %{count} 个字体文件"
+        zh-HK: "已匯入 %{count} 個字型檔"
+      custom_fonts_import_success_with_monospace:
+        en: "Imported %{count} font file(s). %{monospace_count} monospace font family name(s) are available for terminal."
+        zh-CN: "已导入 %{count} 个字体文件，其中 %{monospace_count} 个等宽字体名称可用于终端。"
+        zh-HK: "已匯入 %{count} 個字型檔，其中 %{monospace_count} 個等寬字型名稱可用於終端。"
+      custom_fonts_import_empty:
+        en: No supported font files were imported
+        zh-CN: 未导入支持的字体文件
+        zh-HK: 未匯入支援的字型檔
       font_size:
         en: Font Size
         zh-CN: 字体大小
@@ -571,6 +1084,60 @@ Settings:
         en: Adjust font size for better readability (8-72)
         zh-CN: 调整字体大小以获得更好的可读性（8-72）
         zh-HK: 調整字型大小以獲得更好的可讀性（8-72）
+
+    LocalTerminal:
+      group_title:
+        en: Local Terminal
+        zh-CN: 本地终端
+        zh-HK: 本機終端
+      profile:
+        en: Default shell
+        zh-CN: 默认终端
+        zh-HK: 預設終端
+      profile_desc:
+        en: Choose the shell used when opening a new local terminal tab
+        zh-CN: 选择新建本地终端标签页时使用的 shell
+        zh-HK: 選擇新增本機終端分頁時使用的 shell
+      system:
+        en: System Default
+        zh-CN: 系统默认
+        zh-HK: 系統預設
+      powershell:
+        en: PowerShell
+        zh-CN: PowerShell
+        zh-HK: PowerShell
+      cmd:
+        en: Command Prompt
+        zh-CN: 命令提示符（CMD）
+        zh-HK: 命令提示字元（CMD）
+      wsl:
+        en: WSL
+        zh-CN: WSL
+        zh-HK: WSL
+      git_bash:
+        en: Git Bash
+        zh-CN: Git Bash
+        zh-HK: Git Bash
+      custom:
+        en: Custom
+        zh-CN: 自定义
+        zh-HK: 自訂
+      custom_program:
+        en: Custom program
+        zh-CN: 自定义程序
+        zh-HK: 自訂程式
+      custom_program_desc:
+        en: Executable path or command used when the Custom profile is selected
+        zh-CN: 选择“自定义”时使用的可执行程序路径或命令
+        zh-HK: 選擇「自訂」時使用的可執行程式路徑或命令
+      custom_arguments:
+        en: Custom arguments
+        zh-CN: 自定义参数
+        zh-HK: 自訂參數
+      custom_arguments_desc:
+        en: Arguments are parsed safely and passed directly to the program without a command shell
+        zh-CN: 参数会被安全解析并直接传给程序，不经过命令 shell
+        zh-HK: 參數會被安全解析並直接傳給程式，不經過命令 shell
 
     # 终端设置
     Terminal:
@@ -610,6 +1177,52 @@ Settings:
         en: Paste clipboard content with middle mouse button
         zh-CN: 使用鼠标中键粘贴剪贴板内容
         zh-HK: 使用滑鼠中鍵貼上剪貼簿內容
+
+    RemoteFileEditor:
+      group_title:
+        en: Remote File Editor
+        zh-CN: 远程文件编辑器
+        zh-HK: 遠端檔案編輯器
+      default_editor:
+        en: Default External Editor
+        zh-CN: 默认外部编辑器
+        zh-HK: 預設外部編輯器
+      default_editor_desc:
+        en: Put this installed editor first in matching Edit With menus
+        zh-CN: 在匹配的“使用外部编辑器编辑”菜单中优先显示此编辑器
+        zh-HK: 在匹配的「使用外部編輯器編輯」選單中優先顯示此編輯器
+      none:
+        en: No preference
+        zh-CN: 无偏好
+        zh-HK: 無偏好
+      auto_upload:
+        en: Automatically Upload External Editor Changes
+        zh-CN: 自动上传外部编辑器的修改
+        zh-HK: 自動上傳外部編輯器的修改
+      auto_upload_desc:
+        en: Automatically upload changes after an external editor saves the local temporary file
+        zh-CN: 外部编辑器保存本地临时文件后，自动将修改上传到远程服务器
+        zh-HK: 外部編輯器儲存本機暫存檔案後，自動將修改上傳到遠端伺服器
+      conflict_check:
+        en: Check Remote Changes Before Upload
+        zh-CN: 上传前检查远程文件变更
+        zh-HK: 上傳前檢查遠端檔案變更
+      conflict_check_desc:
+        en: Prompt before overwriting when the remote file changed after it was opened
+        zh-CN: 当远程文件在打开后发生变化时，覆盖前进行提示
+        zh-HK: 當遠端檔案在打開後發生變化時，覆蓋前進行提示
+      choose_program:
+        en: Choose Executable
+        zh-CN: 选择可执行文件
+        zh-HK: 選擇可執行檔
+      select_program:
+        en: Select the external editor executable
+        zh-CN: 选择外部编辑器可执行文件
+        zh-HK: 選擇外部編輯器可執行檔
+      program_override_desc:
+        en: Override the executable path contributed by this extension on this machine
+        zh-CN: 覆盖此扩展在当前设备上提供的可执行文件路径
+        zh-HK: 覆蓋此擴充套件在目前裝置上提供的可執行檔路徑
 
     # 数据库设置
     Database:
@@ -665,7 +1278,333 @@ Settings:
         en: Set the interval for automatic saving (1-60 seconds)
         zh-CN: 设置自动保存的时间间隔（1-60秒）
         zh-HK: 設置自動保存的時間間隔（1-60秒）
+      sql_query_max_rows:
+        en: SQL Query Max Rows
+        zh-CN: SQL 查询最大行数
+        zh-HK: SQL 查詢最大行數
+      sql_query_max_rows_desc:
+        en: Default maximum rows returned by SQL editor queries. Set 0 for unlimited.
+        zh-CN: SQL 编辑器查询默认返回的最大行数，设为 0 表示不限制。
+        zh-HK: SQL 編輯器查詢預設返回的最大行數，設為 0 表示不限制。
+      table_row_height:
+        en: Table Row Height (px)
+        zh-CN: 表格行高（像素）
+        zh-HK: 表格行高（像素）
+      table_row_height_desc:
+        en: Set the height of database table and editable grid rows (24-100 pixels)
+        zh-CN: 设置数据库表和可编辑表格的行高（24-100像素）
+        zh-HK: 設置資料庫表和可編輯表格的行高（24-100像素）
 
+    ToolExposure:
+      mcp_group_title:
+        en: MCP Tool Exposure
+        zh-CN: MCP 工具暴露
+        zh-HK: MCP 工具暴露
+      agent_group_title:
+        en: Agent Tool Exposure
+        zh-CN: Agent 工具暴露
+        zh-HK: Agent 工具暴露
+      terminal:
+        en: Terminal Tools
+        zh-CN: 终端工具
+        zh-HK: 終端工具
+      terminal_desc:
+        en: Expose active terminal session tools on this surface
+        zh-CN: 在这一调用面暴露当前终端会话工具
+        zh-HK: 在這一調用面暴露當前終端會話工具
+      terminal_ssh_exec:
+        en: SSH Exec Tools
+        zh-CN: SSH 执行工具
+        zh-HK: SSH 執行工具
+      terminal_ssh_exec_desc:
+        en: Expose structured SSH command execution tools
+        zh-CN: 暴露结构化 SSH 命令执行工具
+        zh-HK: 暴露結構化 SSH 命令執行工具
+      terminal_exec:
+        en: Visible Terminal Exec
+        zh-CN: 可见终端执行
+        zh-HK: 可見終端執行
+      terminal_exec_desc:
+        en: Expose tools that type commands or send explicit Ctrl+C to visible terminal PTYs
+        zh-CN: 暴露向可见终端 PTY 输入命令或显式发送 Ctrl+C 的工具
+        zh-HK: 暴露向可見終端 PTY 輸入命令或明確傳送 Ctrl+C 的工具
+      connections:
+        en: Connection Tools
+        zh-CN: 连接工具
+        zh-HK: 連線工具
+      connections_desc:
+        en: Expose saved connection inspection, save, and session tools
+        zh-CN: 暴露已保存连接的查看、保存和会话工具
+        zh-HK: 暴露已儲存連線的查看、儲存和會話工具
+      sftp:
+        en: SFTP Tools
+        zh-CN: SFTP 工具
+        zh-HK: SFTP 工具
+      sftp_desc:
+        en: Expose SSH/SFTP file operation tools
+        zh-CN: 暴露 SSH/SFTP 文件操作工具
+        zh-HK: 暴露 SSH/SFTP 檔案操作工具
+      redis:
+        en: Redis Tools
+        zh-CN: Redis 工具
+        zh-HK: Redis 工具
+      redis_desc:
+        en: Expose Redis inspection and command tools
+        zh-CN: 暴露 Redis 查看和命令工具
+        zh-HK: 暴露 Redis 查看和命令工具
+      database:
+        en: Database Tools
+        zh-CN: 数据库工具
+        zh-HK: 資料庫工具
+      database_desc:
+        en: Expose database query, schema, and execution tools
+        zh-CN: 暴露数据库查询、结构和执行工具
+        zh-HK: 暴露資料庫查詢、結構和執行工具
+      internal_functions:
+        en: Internal Function Tools
+        zh-CN: 内置函数工具
+        zh-HK: 內建函數工具
+      internal_functions_desc:
+        en: Expose app-provided function tools to the built-in Agent
+        zh-CN: 向内置 Agent 暴露应用内置函数工具
+        zh-HK: 向內建 Agent 暴露應用內建函數工具
+    Mcp:
+      group_title:
+        en: MCP
+        zh-CN: MCP
+        zh-HK: MCP
+      server_enabled:
+        en: Enable MCP Server
+        zh-CN: 启用 MCP Server
+        zh-HK: 啟用 MCP Server
+      server_enabled_desc:
+        en: Start the shared MCP endpoint for external clients and internal tool callers
+        zh-CN: 为外部客户端和内部工具调用启动统一 MCP 端点
+        zh-HK: 為外部客戶端和內部工具調用啟動統一 MCP 端點
+      server_mode:
+        en: Server Mode
+        zh-CN: Server 模式
+        zh-HK: Server 模式
+      server_mode_desc:
+        en: Choose whether discovery is temporary for the current app session or persistent across launches
+        zh-CN: 选择 discovery 配置仅用于当前应用会话，还是跨启动保持
+        zh-HK: 選擇 discovery 配置僅用於當前應用會話，還是跨啟動保持
+      server_mode_temporary:
+        en: Temporary
+        zh-CN: 临时
+        zh-HK: 臨時
+      server_mode_persistent:
+        en: Persistent
+        zh-CN: 持久
+        zh-HK: 持久
+      permission_mode:
+        en: Permission Profile
+        zh-CN: 权限档位
+        zh-HK: 權限檔位
+      permission_mode_desc:
+        en: Map MCP access to the unified tool runtime permission profile
+        zh-CN: 将 MCP 访问映射到统一工具运行时权限档位
+        zh-HK: 將 MCP 訪問映射到統一工具運行時權限檔位
+      permission_profile_safe:
+        en: Safe
+        zh-CN: 安全模式
+        zh-HK: 安全模式
+      permission_profile_confirm:
+        en: Confirm
+        zh-CN: 确认模式
+        zh-HK: 確認模式
+      permission_profile_auto:
+        en: Auto
+        zh-CN: 自动模式
+        zh-HK: 自動模式
+      permission_mode_deny:
+        en: Deny
+        zh-CN: 拒绝
+        zh-HK: 拒絕
+      permission_mode_ask:
+        en: Ask
+        zh-CN: 询问
+        zh-HK: 詢問
+      permission_mode_allow:
+        en: Allow
+        zh-CN: 允许
+        zh-HK: 允許
+      status:
+        en: Runtime Status
+        zh-CN: 运行状态
+        zh-HK: 運行狀態
+      status_desc:
+        en: Current MCP server lifecycle state, bind address, and discovery file
+        zh-CN: 当前 MCP Server 生命周期状态、监听地址和 discovery 文件
+        zh-HK: 當前 MCP Server 生命週期狀態、監聽地址和 discovery 檔案
+      status_disabled:
+        en: Disabled
+        zh-CN: 已关闭
+        zh-HK: 已關閉
+      status_starting:
+        en: Starting
+        zh-CN: 启动中
+        zh-HK: 啟動中
+      status_running:
+        en: Running
+        zh-CN: 运行中
+        zh-HK: 運行中
+      status_failed:
+        en: Failed
+        zh-CN: 启动失败
+        zh-HK: 啟動失敗
+      install_client_config:
+        en: Install
+        zh-CN: 安装
+        zh-HK: 安裝
+      install_helper:
+        en: Install MCP Helper
+        zh-CN: 安装 MCP Helper
+        zh-HK: 安裝 MCP Helper
+      install_helper_desc:
+        en: Download the public MCP helper from the extension marketplace before writing client configs
+        zh-CN: 从扩展市场下载 Public MCP helper，然后再写入客户端配置
+        zh-HK: 從擴展市場下載 Public MCP helper，然後再寫入客戶端配置
+      install_helper_button:
+        en: Download
+        zh-CN: 下载
+        zh-HK: 下載
+      install_helper_started:
+        en: Installing MCP helper from extension marketplace...
+        zh-CN: 正在从扩展市场安装 MCP helper...
+        zh-HK: 正在從擴展市場安裝 MCP helper...
+      install_helper_already_running:
+        en: MCP helper installation is already running
+        zh-CN: MCP helper 正在安装中
+        zh-HK: MCP helper 正在安裝中
+      install_helper_success:
+        en: "MCP helper installed: %{path}"
+        zh-CN: "MCP helper 已安装：%{path}"
+        zh-HK: "MCP helper 已安裝：%{path}"
+      install_helper_failed:
+        en: "Failed to install MCP helper: %{error}"
+        zh-CN: "MCP helper 安装失败：%{error}"
+        zh-HK: "MCP helper 安裝失敗：%{error}"
+      helper_status_installed:
+        en: "Installed at %{path}"
+        zh-CN: "已安装：%{path}"
+        zh-HK: "已安裝：%{path}"
+      helper_status_missing:
+        en: "Expected at %{path}"
+        zh-CN: "预期路径：%{path}"
+        zh-HK: "預期路徑：%{path}"
+      helper_status_unusable:
+        en: "MCP helper is not executable: %{path}"
+        zh-CN: "MCP helper 不可执行：%{path}"
+        zh-HK: "MCP helper 不可執行：%{path}"
+      helper_status_installing:
+        en: Installing from extension marketplace...
+        zh-CN: 正在从扩展市场安装...
+        zh-HK: 正在從擴展市場安裝...
+      helper_status_connecting:
+        en: Connecting to download source...
+        zh-CN: 正在连接下载源...
+        zh-HK: 正在連接下載源...
+      helper_status_downloading:
+        en: "Downloading MCP helper %{percent}%"
+        zh-CN: "正在下载 MCP helper %{percent}%"
+        zh-HK: "正在下載 MCP helper %{percent}%"
+      helper_status_downloading_unknown:
+        en: Downloading MCP helper...
+        zh-CN: 正在下载 MCP helper...
+        zh-HK: 正在下載 MCP helper...
+      helper_status_retrying:
+        en: Download source failed, retrying...
+        zh-CN: 下载源失败，正在重试...
+        zh-HK: 下載源失敗，正在重試...
+      helper_status_installing_package:
+        en: Installing MCP helper...
+        zh-CN: 正在安装 MCP helper...
+        zh-HK: 正在安裝 MCP helper...
+      install_codex_config:
+        en: Install Codex MCP Config
+        zh-CN: 安装 Codex MCP 配置
+        zh-HK: 安裝 Codex MCP 配置
+      install_codex_config_desc:
+        en: Write or update the managed OnetCli MCP server entry in ~/.codex/config.toml
+        zh-CN: 在 ~/.codex/config.toml 中写入或更新 OnetCli MCP Server 托管配置
+        zh-HK: 在 ~/.codex/config.toml 中寫入或更新 OnetCli MCP Server 託管配置
+      install_claude_config:
+        en: Install Claude MCP Config
+        zh-CN: 安装 Claude MCP 配置
+        zh-HK: 安裝 Claude MCP 配置
+      install_claude_config_desc:
+        en: Write or update the OnetCli MCP server entry in Claude Desktop config
+        zh-CN: 在 Claude Desktop 配置中写入或更新 OnetCli MCP Server
+        zh-HK: 在 Claude Desktop 配置中寫入或更新 OnetCli MCP Server
+      install_claude_code_config:
+        en: Install Claude Code MCP Config
+        zh-CN: 安装 Claude Code MCP 配置
+        zh-HK: 安裝 Claude Code MCP 配置
+      install_claude_code_config_desc:
+        en: Write or update the OnetCli MCP server entry in ~/.claude.json
+        zh-CN: 在 ~/.claude.json 中写入或更新 OnetCli MCP Server
+        zh-HK: 在 ~/.claude.json 中寫入或更新 OnetCli MCP Server
+      copy_agent_config:
+        en: Copy MCP Config
+        zh-CN: 复制 MCP 配置
+        zh-HK: 複製 MCP 配置
+      copy_agent_config_desc:
+        en: Copy a generic mcpServers JSON block for other agents
+        zh-CN: 复制通用 mcpServers JSON 配置，供其他 agent 使用
+        zh-HK: 複製通用 mcpServers JSON 配置，供其他 agent 使用
+      copy_agent_config_button:
+        en: Copy Config
+        zh-CN: 复制配置
+        zh-HK: 複製配置
+      copy_agent_config_success:
+        en: MCP config copied
+        zh-CN: MCP 配置已复制
+        zh-HK: MCP 配置已複製
+      copy_agent_config_failed:
+        en: "Failed to copy MCP config: %{error}"
+        zh-CN: "MCP 配置复制失败：%{error}"
+        zh-HK: "MCP 配置複製失敗：%{error}"
+      install_client_config_success:
+        en: "MCP client config installed: %{path}"
+        zh-CN: "MCP 客户端配置已安装：%{path}"
+        zh-HK: "MCP 客戶端配置已安裝：%{path}"
+      install_client_config_failed:
+        en: "Failed to install MCP client config: %{error}"
+        zh-CN: "MCP 客户端配置安装失败：%{error}"
+        zh-HK: "MCP 客戶端配置安裝失敗：%{error}"
+      uninstall_client_config:
+        en: Uninstall
+        zh-CN: 卸载
+        zh-HK: 卸載
+      uninstall_client_config_success:
+        en: "MCP client config uninstalled: %{path}"
+        zh-CN: "MCP 客户端配置已卸载：%{path}"
+        zh-HK: "MCP 客戶端配置已卸載：%{path}"
+      uninstall_client_config_failed:
+        en: "Failed to uninstall MCP client config: %{error}"
+        zh-CN: "MCP 客户端配置卸载失败：%{error}"
+        zh-HK: "MCP 客戶端配置卸載失敗：%{error}"
+      client_config_status_up_to_date:
+        en: Up to date
+        zh-CN: 已是最新
+        zh-HK: 已是最新
+      client_config_status_not_installed:
+        en: Not installed
+        zh-CN: 未安装
+        zh-HK: 未安裝
+      client_config_status_needs_repair:
+        en: Needs repair
+        zh-CN: 需要修复
+        zh-HK: 需要修復
+      client_config_status_missing_helper:
+        en: MCP helper not installed
+        zh-CN: MCP helper 未安装
+        zh-HK: MCP helper 未安裝
+      client_config_status_unusable_helper:
+        en: MCP helper is not executable
+        zh-CN: MCP helper 不可执行
+        zh-HK: MCP helper 不可執行
     Log:
       group_title:
         en: Log
@@ -776,6 +1715,123 @@ Settings:
         zh-CN: 全局代理设置已生效
         zh-HK: 全局代理設置已生效
 
+  Sync:
+    title:
+      en: Sync
+      zh-CN: 同步
+      zh-HK: 同步
+    group_title:
+      en: Sync
+      zh-CN: 同步
+      zh-HK: 同步
+    provider:
+      en: Sync Provider
+      zh-CN: 同步方式
+      zh-HK: 同步方式
+    provider_desc:
+      en: Choose one sync backend. Only the selected backend runs from the home sync action and automatic data changes.
+      zh-CN: 选择一套同步后端。主页同步和数据变更自动同步只会运行所选后端。
+      zh-HK: 選擇一套同步後端。主頁同步和資料變更自動同步只會執行所選後端。
+    backend:
+      en: Backend
+      zh-CN: 后端
+      zh-HK: 後端
+    backend_desc:
+      en: Folder works with local folders, iCloud Drive, OneDrive, and other synced directories; Git adds commit and push support.
+      zh-CN: 文件夹后端可用于本地文件夹、iCloud Drive、OneDrive 以及其他同步目录；Git 后端会增加提交和推送。
+      zh-HK: 資料夾後端可用於本機資料夾、iCloud Drive、OneDrive 以及其他同步目錄；Git 後端會增加提交和推送。
+    path:
+      en: Sync Path
+      zh-CN: 同步路径
+      zh-HK: 同步路徑
+    path_desc:
+      en: Choose the folder or Git repository that stores the .onetcli-sync package.
+      zh-CN: 选择保存 .onetcli-sync 同步包的文件夹或 Git 仓库。
+      zh-HK: 選擇保存 .onetcli-sync 同步包的資料夾或 Git 倉庫。
+    select_directory:
+      en: Select Directory
+      zh-CN: 选择目录
+      zh-HK: 選擇目錄
+    auto_sync:
+      en: Auto Sync
+      zh-CN: 自动同步
+      zh-HK: 自動同步
+    auto_sync_desc:
+      en: Automatically sync when local data or backend files change.
+      zh-CN: 当本地数据或后端文件变化时自动同步。
+      zh-HK: 當本機資料或後端檔案變更時自動同步。
+    git_auto_push:
+      en: Git Auto Push
+      zh-CN: Git 自动推送
+      zh-HK: Git 自動推送
+    git_auto_push_desc:
+      en: Push personal sync commits after Git backend writes.
+      zh-CN: Git 后端写入后自动推送个人同步提交。
+      zh-HK: Git 後端寫入後自動推送個人同步提交。
+    status:
+      en: Status
+      zh-CN: 状态
+      zh-HK: 狀態
+    test_connection:
+      en: Test
+      zh-CN: 测试
+      zh-HK: 測試
+    sync_now:
+      en: Sync Now
+      zh-CN: 立即同步
+      zh-HK: 立即同步
+    Backend:
+      folder:
+        en: Folder
+        zh-CN: 文件夹
+        zh-HK: 資料夾
+      git:
+        en: Git
+        zh-CN: Git
+        zh-HK: Git
+    Provider:
+      onet_cloud:
+        en: OnetCli Cloud Sync
+        zh-CN: OnetCli 云同步
+        zh-HK: OnetCli 雲同步
+      personal:
+        en: Personal Sync
+        zh-CN: 个人同步
+        zh-HK: 個人同步
+    Status:
+      ready:
+        en: Ready
+        zh-CN: 就绪
+        zh-HK: 就緒
+      syncing:
+        en: Syncing
+        zh-CN: 同步中
+        zh-HK: 同步中
+      not_configured:
+        en: Not configured
+        zh-CN: 未配置
+        zh-HK: 未配置
+      directory_unavailable:
+        en: Directory unavailable
+        zh-CN: 目录不可用
+        zh-HK: 目錄不可用
+      schema_unsupported:
+        en: Sync schema unsupported
+        zh-CN: 同步格式版本不受支持
+        zh-HK: 同步格式版本不受支援
+      git_auth_required:
+        en: Git authentication required
+        zh-CN: 需要 Git 认证
+        zh-HK: 需要 Git 認證
+      git_merge_conflict:
+        en: Git merge conflict
+        zh-CN: Git 合并冲突
+        zh-HK: Git 合併衝突
+      paused_after_repeated_failures:
+        en: Paused after repeated failures
+        zh-CN: 多次失败后已暂停
+        zh-HK: 多次失敗後已暫停
+
   # 快捷键
   Shortcuts:
     title:
@@ -787,9 +1843,21 @@ Settings:
       zh-CN: 系统热键
       zh-HK: 系統熱鍵
     system_hotkey_desc:
-      en: Customize the global window toggle hotkey with keystroke syntax like cmd-alt-m or ctrl-space. Changes take effect after restarting the app, and invalid input is ignored.
-      zh-CN: 使用类似 cmd-alt-m 或 ctrl-space 的快捷键格式自定义全局窗口切换热键。修改后需重启应用生效，非法输入不会保存。
-      zh-HK: 使用類似 cmd-alt-m 或 ctrl-space 的快捷鍵格式自定義全域視窗切換熱鍵。修改後需重新啟動應用生效，非法輸入不會保存。
+      en: Customize shortcuts with keystroke syntax like cmd-alt-m or ctrl-space. Invalid input is ignored.
+      zh-CN: 使用类似 cmd-alt-m 或 ctrl-space 的快捷键格式自定义快捷键。非法输入不会保存。
+      zh-HK: 使用類似 cmd-alt-m 或 ctrl-space 的快捷鍵格式自定義快捷鍵。非法輸入不會保存。
+    press_shortcut:
+      en: Press shortcut
+      zh-CN: 按下快捷键
+      zh-HK: 按下快捷鍵
+    invalid_hotkey:
+      en: Invalid shortcut
+      zh-CN: 快捷键不可用
+      zh-HK: 快捷鍵不可用
+    reset:
+      en: Reset
+      zh-CN: 重置
+      zh-HK: 重置
     window:
       en: Window Management
       zh-CN: 窗口管理
@@ -802,10 +1870,30 @@ Settings:
       en: Tabs
       zh-CN: 标签页
       zh-HK: 標籤頁
+    connection_dialog:
+      en: New Connection Dialog
+      zh-CN: 新建连接弹窗
+      zh-HK: 新建連線彈窗
     terminal:
       en: Terminal
       zh-CN: 终端
       zh-HK: 終端
+    database:
+      en: SQL Editor
+      zh-CN: SQL 编辑器
+      zh-HK: SQL 編輯器
+    table:
+      en: Data Table
+      zh-CN: 数据表格
+      zh-HK: 數據表格
+    remote_editor:
+      en: Remote File Editor
+      zh-CN: 远程文件编辑器
+      zh-HK: 遠端檔案編輯器
+    redis_cli:
+      en: Redis CLI
+      zh-CN: Redis CLI
+      zh-HK: Redis CLI
     minimize_window:
       en: Minimize / Activate Window
       zh-CN: 最小化 / 激活窗口
@@ -814,6 +1902,10 @@ Settings:
       en: Toggle Fullscreen
       zh-CN: 切换全屏
       zh-HK: 切換全螢幕
+    toggle_always_on_top:
+      en: Toggle Always On Top
+      zh-CN: 切换窗口置顶
+      zh-HK: 切換視窗置頂
     toggle_zoom:
       en: Toggle Panel Zoom
       zh-CN: 切换面板缩放
@@ -826,6 +1918,14 @@ Settings:
       en: "Switch to Tab N"
       zh-CN: "切换到第 N 个标签页"
       zh-HK: "切換到第 N 個標籤頁"
+    switch_next_tab:
+      en: Switch to Next Tab
+      zh-CN: 切换到下一个标签页
+      zh-HK: 切換到下一個標籤頁
+    switch_previous_tab:
+      en: Switch to Previous Tab
+      zh-CN: 切换到上一个标签页
+      zh-HK: 切換到上一個標籤頁
     duplicate_tab:
       en: Duplicate Tab
       zh-CN: 复制标签页
@@ -838,6 +1938,30 @@ Settings:
       en: New Connection
       zh-CN: 新建连接
       zh-HK: 新建連線
+    open_local_terminal:
+      en: Open Local Terminal
+      zh-CN: 打开本地终端
+      zh-HK: 打開本機終端
+    connection_previous_type:
+      en: Previous Connection Type
+      zh-CN: 上一个连接类型
+      zh-HK: 上一個連線類型
+    connection_next_type:
+      en: Next Connection Type
+      zh-CN: 下一个连接类型
+      zh-HK: 下一個連線類型
+    connection_open_type:
+      en: Open Selected Type
+      zh-CN: 打开选中类型
+      zh-HK: 打開選中類型
+    terminal_send_tab:
+      en: Send Tab
+      zh-CN: 发送 Tab
+      zh-HK: 發送 Tab
+    terminal_send_shift_tab:
+      en: Send Shift+Tab
+      zh-CN: 发送 Shift+Tab
+      zh-HK: 發送 Shift+Tab
     terminal_copy:
       en: Copy
       zh-CN: 复制
@@ -850,10 +1974,22 @@ Settings:
       en: Search
       zh-CN: 搜索
       zh-HK: 搜尋
+    terminal_search_previous:
+      en: Previous Search Match
+      zh-CN: 上一个搜索结果
+      zh-HK: 上一個搜尋結果
     terminal_select_all:
       en: Select All
       zh-CN: 全选
       zh-HK: 全選
+    terminal_clear_screen:
+      en: Clear Screen
+      zh-CN: 清屏
+      zh-HK: 清屏
+    terminal_clear_selection:
+      en: Clear Selection
+      zh-CN: 清除选区
+      zh-HK: 清除選區
     terminal_zoom_in:
       en: Zoom In
       zh-CN: 放大字体
@@ -870,6 +2006,86 @@ Settings:
       en: Toggle Vi Mode
       zh-CN: 切换 Vi 模式
       zh-HK: 切換 Vi 模式
+    database_focus_search:
+      en: Focus Search
+      zh-CN: 聚焦搜索
+      zh-HK: 聚焦搜尋
+    database_open_table_query:
+      en: Query Selected Table
+      zh-CN: 查询选中表
+      zh-HK: 查詢選中表
+    sql_run_query:
+      en: Run Current Query
+      zh-CN: 执行当前查询
+      zh-HK: 執行當前查詢
+    sql_run_all_query:
+      en: Run All Queries
+      zh-CN: 执行全部查询
+      zh-HK: 執行全部查詢
+    table_move_selection:
+      en: Move Selection
+      zh-CN: 移动选区
+      zh-HK: 移動選區
+    table_first_last:
+      en: First / Last Row
+      zh-CN: 首行 / 末行
+      zh-HK: 首行 / 末行
+    table_page:
+      en: Page Up / Down
+      zh-CN: 上下翻页
+      zh-HK: 上下翻頁
+    table_next_previous_cell:
+      en: Next / Previous Cell
+      zh-CN: 下一个 / 上一个单元格
+      zh-HK: 下一個 / 上一個儲存格
+    table_copy:
+      en: Copy
+      zh-CN: 复制
+      zh-HK: 複製
+    table_paste:
+      en: Paste
+      zh-CN: 粘贴
+      zh-HK: 貼上
+    table_select_all:
+      en: Select All
+      zh-CN: 全选
+      zh-HK: 全選
+    table_cancel:
+      en: Cancel Selection
+      zh-CN: 取消选择
+      zh-HK: 取消選擇
+    remote_editor_search:
+      en: Search
+      zh-CN: 搜索
+      zh-HK: 搜尋
+    remote_editor_replace:
+      en: Replace
+      zh-CN: 替换
+      zh-HK: 取代
+    redis_clear_output:
+      en: Clear Output
+      zh-CN: 清空输出
+      zh-HK: 清空輸出
+    redis_copy:
+      en: Copy
+      zh-CN: 复制
+      zh-HK: 複製
+    redis_paste:
+      en: Paste
+      zh-CN: 粘贴
+      zh-HK: 貼上
+    redis_select_all:
+      en: Select All
+      zh-CN: 全选
+      zh-HK: 全選
+    redis_clear_selection:
+      en: Clear Selection
+      zh-CN: 清除选区
+      zh-HK: 清除選區
+    redis_complete_command:
+      en: Complete Command
+      zh-CN: 补全命令
+      zh-HK: 補全命令
 
   # 关于页面
   About:
@@ -975,79 +2191,107 @@ License:
     en: This feature requires a Pro subscription
     zh-CN: 此功能需要 Pro 订阅
     zh-HK: 此功能需要 Pro 訂閱
+  import_offline:
+    en: Import Offline License
+    zh-CN: 导入离线 License
+    zh-HK: 匯入離線 License
+  select_file:
+    en: Select License File
+    zh-CN: 选择 License 文件
+    zh-HK: 選擇 License 檔案
+  import_success:
+    en: Offline License imported successfully
+    zh-CN: 离线 License 导入成功
+    zh-HK: 離線 License 匯入成功
+  import_failed:
+    en: "Failed to import offline License: %{error}"
+    zh-CN: "离线 License 导入失败: %{error}"
+    zh-HK: "離線 License 匯入失敗: %{error}"
+  offline_public_key_missing:
+    en: Offline License public key is not configured
+    zh-CN: 未配置离线 License 公钥
+    zh-HK: 未設定離線 License 公鑰
+  offline_public_key_decode_failed:
+    en: "Failed to decode offline License public key: %{error}"
+    zh-CN: "离线 License 公钥解码失败: %{error}"
+    zh-HK: "離線 License 公鑰解碼失敗: %{error}"
+  offline_public_key_invalid_length:
+    en: Offline License public key length is invalid
+    zh-CN: 离线 License 公钥长度错误
+    zh-HK: 離線 License 公鑰長度錯誤
 
 # 应用更新
 Update:
   title:
-    en: 发现新版本
+    en: New version available
     zh-CN: 发现新版本
     zh-HK: 发现新版本
   message:
-    en: "已发布新版本 %{latest}（当前 %{current}），是否立即更新？"
+    en: "Version %{latest} is available (current %{current}). Update now?"
     zh-CN: "已发布新版本 %{latest}（当前 %{current}），是否立即更新？"
     zh-HK: "已發布新版本 %{latest}（當前 %{current}），是否立即更新？"
   action_download:
-    en: 下载更新
+    en: Download Update
     zh-CN: 下载更新
     zh-HK: 下載更新
   action_install:
-    en: 立即更新
+    en: Update Now
     zh-CN: 立即更新
     zh-HK: 立即更新
   action_downloading:
-    en: 下载中...
+    en: Downloading...
     zh-CN: 下载中...
     zh-HK: 下載中...
   action_applying:
-    en: 更新中...
+    en: Updating...
     zh-CN: 更新中...
     zh-HK: 更新中...
   later:
-    en: 稍后再说
+    en: Later
     zh-CN: 稍后再说
     zh-HK: 稍后再说
   release_notes:
-    en: 更新内容
+    en: Release Notes
     zh-CN: 更新内容
     zh-HK: 更新内容
   ready:
-    en: 准备开始下载更新。
+    en: Ready to download the update.
     zh-CN: 准备开始下载更新。
     zh-HK: 準備開始下載更新。
   downloading:
-    en: 正在下载更新，请稍候...
+    en: Downloading the update. Please wait...
     zh-CN: 正在下载更新，请稍候...
     zh-HK: 正在下載更新，請稍候...
   download_complete:
-    en: 下载完成，请点击“立即更新”开始安装。
+    en: Download complete. Click "Update Now" to start installing.
     zh-CN: 下载完成，请点击“立即更新”开始安装。
     zh-HK: 下載完成，請點擊「立即更新」開始安裝。
   applying:
-    en: 正在安装更新，请稍候...
+    en: Installing the update. Please wait...
     zh-CN: 正在安装更新，请稍候...
     zh-HK: 正在安裝更新，請稍候...
   download_failed:
-    en: 下载失败，请重试。
+    en: Download failed. Please try again.
     zh-CN: 下载失败，请重试。
     zh-HK: 下載失敗，請重試。
   apply_failed:
-    en: 更新失败，请稍后重试。
+    en: Update failed. Please try again later.
     zh-CN: 更新失败，请稍后重试。
     zh-HK: 更新失敗，請稍後重試。
   error_prefix:
-    en: 错误
+    en: Error
     zh-CN: 错误
     zh-HK: 錯誤
   missing_download_url:
-    en: 缺少下载地址，无法更新。
+    en: Download URL is missing. The update cannot continue.
     zh-CN: 缺少下载地址，无法更新。
     zh-HK: 缺少下載地址，無法更新。
   missing_download_file:
-    en: 未找到下载文件，请重新下载后再更新。
+    en: Downloaded file was not found. Please download the update again.
     zh-CN: 未找到下载文件，请重新下载后再更新。
     zh-HK: 未找到下載文件，請重新下載後再更新。
   downloading_blocked:
-    en: 正在下载更新，请稍后关闭。
+    en: Update download is in progress. Please close this later.
     zh-CN: 正在下载更新，请稍后关闭。
     zh-HK: 正在下載更新，請稍後關閉。
   network_check_failed:
@@ -1162,6 +2406,14 @@ LlmProviders:
     en: Delete
     zh-CN: 删除
     zh-HK: 刪除
+  delete_confirm_title:
+    en: Delete provider
+    zh-CN: 删除提供商
+    zh-HK: 刪除提供商
+  delete_confirm_message:
+    en: "Delete provider %{provider_name}? This action cannot be undone."
+    zh-CN: "确定删除提供商 %{provider_name} 吗？此操作不可撤销。"
+    zh-HK: "確定刪除提供商 %{provider_name} 嗎？此操作不可撤銷。"
   action_set_default:
     en: Set Default
     zh-CN: 设为默认
@@ -1234,6 +2486,10 @@ LlmProviders:
     en: Loading...
     zh-CN: 加载中...
     zh-HK: 載入中...
+  model_load_success:
+    en: "Loaded %{count} models. They are now available in the dropdown above."
+    zh-CN: "已加载 %{count} 个模型，已更新到上方下拉列表。"
+    zh-HK: "已載入 %{count} 個模型，已更新到上方下拉列表。"
   set_default:
     en: Set as default provider
     zh-CN: 设为默认提供商
@@ -1242,6 +2498,10 @@ LlmProviders:
     en: Model list is empty
     zh-CN: 模型列表为空
     zh-HK: 模型列表為空
+  model_load_empty_inline:
+    en: No models were returned. Check the provider configuration and try again.
+    zh-CN: 未返回模型，请检查提供商配置后重试。
+    zh-HK: 未返回模型，請檢查提供商配置後重試。
   model_load_failed:
     en: "Failed to load models: %{error}"
     zh-CN: "模型加载失败: %{error}"
@@ -1266,6 +2526,31 @@ LlmProviders:
 
 Serial:
   new:
-    en: Serial
-    zh-CN: 串口
-    zh-HK: 串口
+    en: New Serial Connection
+    zh-CN: 新建串口连接
+    zh-HK: 新建串口連接
+  edit:
+    en: Edit Serial Connection
+    zh-CN: 编辑串口连接
+    zh-HK: 編輯串口連接
+
+RemoteDesktopForm:
+  title_new:
+    en: "New %{protocol} Connection"
+    zh-CN: "新建 %{protocol} 连接"
+    zh-HK: "新建 %{protocol} 連線"
+  title_edit:
+    en: "Edit %{protocol} Connection"
+    zh-CN: "编辑 %{protocol} 连接"
+    zh-HK: "編輯 %{protocol} 連線"
+
+
+SSH:
+  new:
+    en: New SSH Connection
+    zh-CN: 新建 SSH 连接
+    zh-HK: 新建 SSH 連線
+  edit:
+    en: Edit SSH Connection
+    zh-CN: 编辑 SSH 连接
+    zh-HK: 編輯 SSH 連線

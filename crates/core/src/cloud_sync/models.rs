@@ -269,6 +269,8 @@ pub struct Team {
 pub enum TeamRole {
     #[serde(rename = "owner")]
     Owner,
+    #[serde(rename = "admin")]
+    Admin,
     #[serde(rename = "member")]
     Member,
 }
@@ -277,6 +279,7 @@ impl std::fmt::Display for TeamRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TeamRole::Owner => write!(f, "owner"),
+            TeamRole::Admin => write!(f, "admin"),
             TeamRole::Member => write!(f, "member"),
         }
     }
@@ -331,4 +334,7 @@ pub struct WorkspacePlainData {
     /// 图标
     #[serde(skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// 工作空间排序值
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<i32>,
 }

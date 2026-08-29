@@ -1,12 +1,15 @@
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, AsyncApp, ClickEvent, Context, Corner, Entity, EventEmitter, FocusHandle,
+    Anchor, AnyElement, App, AsyncApp, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
     Focusable, IntoElement, ParentElement, PathPromptOptions, SharedString, Styled, Subscription,
     Window, actions, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, Size, WindowExt, button::Button,
-    h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Size, WindowExt,
+    button::Button,
+    h_flex,
+    input::{Input, InputEvent, InputState},
+    v_flex,
 };
 use one_ui::edit_table::{Column, EditTable, EditTableEvent, EditTableState};
 use one_ui::{create_large_text_editor_with_content, large_text_values_equivalent};
@@ -15,7 +18,7 @@ use rust_xlsxwriter::Workbook;
 use tracing::{error, log::trace};
 
 use crate::import_export::table_export_view::DataExportView;
-use crate::settings::{LargeTextEditorOpenMode, current_settings as current_db_view_settings};
+use crate::search_shortcut::{DB_SEARCH_CONTEXT, FocusSearchInput, focus_search_input};
 use crate::sql_editor::SqlEditor;
 use crate::table_data::copy_format::{CopyFormat, CopyFormatter, TableMetadata};
 use crate::table_data::filter_editor::{FilterEditorEvent, TableFilterEditor, TableSchema};
@@ -29,6 +32,7 @@ use gpui_component::button::ButtonVariants;
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 use one_core::popup_window::{PopupWindowOptions, open_popup_window};
+use one_core::settings::{AppSettings, LargeTextCellEditorOpenMode};
 use one_core::storage::DatabaseType;
 use one_core::tab_container::TabContainer;
 use one_ui::edit_table::ColumnSort;
@@ -100,10 +104,19 @@ pub struct LargeTextCellTarget {
     pub editable: bool,
 }
 
+struct TextEditorDialogRequest {
+    initial_text: String,
+    title: String,
+    row_ix: usize,
+    col_ix: usize,
+    editable: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum DataGridEvent {
     LargeTextSelectionChanged,
     ToggleLargeTextEditorRequested,
+    OpenTableDesignerRequested,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,10 +125,10 @@ pub enum LargeTextEditorRoute {
     Dialog,
 }
 
-fn resolve_large_text_editor_route(mode: LargeTextEditorOpenMode) -> LargeTextEditorRoute {
+fn resolve_large_text_editor_route(mode: LargeTextCellEditorOpenMode) -> LargeTextEditorRoute {
     match mode {
-        LargeTextEditorOpenMode::SidebarPreview => LargeTextEditorRoute::PagePreview,
-        LargeTextEditorOpenMode::Dialog => LargeTextEditorRoute::Dialog,
+        LargeTextCellEditorOpenMode::SidebarPreview => LargeTextEditorRoute::PagePreview,
+        LargeTextCellEditorOpenMode::Dialog => LargeTextEditorRoute::Dialog,
     }
 }
 
@@ -140,7 +153,7 @@ pub struct DataGridConfig {
     /// 数据库连接ID
     pub connection_id: String,
     /// 数据库类型
-    pub database_type: one_core::storage::DatabaseType,
+    pub database_type: DatabaseType,
     /// 是否允许编辑
     pub editable: bool,
     /// 是否显示工具栏
@@ -160,7 +173,7 @@ impl DataGridConfig {
         database_name: impl Into<String>,
         table_name: impl Into<String>,
         connection_id: impl Into<String>,
-        database_type: one_core::storage::DatabaseType,
+        database_type: DatabaseType,
     ) -> Self {
         Self {
             database_name: database_name.into(),
@@ -325,6 +338,10 @@ fn build_xlsx_bytes(rows: &[Vec<String>]) -> Result<Vec<u8>, String> {
     workbook.save_to_buffer().map_err(|error| error.to_string())
 }
 
+fn table_has_unsaved_changes(editing_cell: Option<(usize, usize)>, change_count: usize) -> bool {
+    editing_cell.is_some() || change_count > 0
+}
+
 /// 数据表格组件
 pub struct DataGrid {
     /// 组件配置
@@ -341,6 +358,10 @@ pub struct DataGrid {
     filter_editor: Entity<TableFilterEditor>,
     /// 过滤器事件订阅
     _filter_sub: Option<Subscription>,
+    /// 当前页本地搜索输入框
+    search_input: Entity<InputState>,
+    /// 搜索输入框事件订阅
+    _search_sub: Option<Subscription>,
     /// 侧边栏大文本编辑器是否已为当前表格打开
     is_large_text_editor_sidebar_open: bool,
 }
@@ -349,7 +370,7 @@ impl DataGrid {
     pub fn new(config: DataGridConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editable = config.editable;
         let is_table_data = config.usage == DataGridUsage::TableData;
-        let database_type = config.database_type;
+        let database_type = config.database_type.clone();
         let table_name = config.table_name.clone();
         let data_grid_handle = cx.entity().downgrade();
         let table = cx.new(|cx| {
@@ -364,6 +385,11 @@ impl DataGrid {
         });
         let focus_handle = cx.focus_handle();
         let filter_editor = cx.new(|cx| TableFilterEditor::new(window, cx));
+        let search_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t!("TableDataGrid.search_placeholder").to_string())
+                .clean_on_escape()
+        });
         let table_data_info = cx.new(|_| TableDataInfo::default());
 
         let mut result = Self {
@@ -374,11 +400,14 @@ impl DataGrid {
             table_data_info,
             filter_editor,
             _filter_sub: None,
+            search_input,
+            _search_sub: None,
             is_large_text_editor_sidebar_open: false,
         };
         result.bind_table_event(window, cx);
         if is_table_data {
             result.bind_filter_event(window, cx);
+            result.bind_search_event(window, cx);
             result.load_data_with_clauses(1, cx);
         }
         result
@@ -414,6 +443,39 @@ impl DataGrid {
             },
         );
         self._filter_sub = Some(sub);
+    }
+
+    fn bind_search_event(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sub = cx.subscribe_in(
+            &self.search_input,
+            window,
+            |this: &mut DataGrid, input, evt: &InputEvent, _window, cx| {
+                if let InputEvent::Change = evt {
+                    let query = input.read(cx).text().to_string();
+                    this.apply_row_search_query(query, cx);
+                }
+            },
+        );
+        self._search_sub = Some(sub);
+    }
+
+    fn apply_row_search_query(&mut self, query: String, cx: &mut Context<Self>) {
+        self.table.update(cx, |state, cx| {
+            state.delegate_mut().set_row_search_query(query);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn on_action_focus_search(
+        &mut self,
+        _: &FocusSearchInput,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.config.usage == DataGridUsage::TableData {
+            focus_search_input(&self.search_input, window, cx);
+        }
     }
 
     // ========== 公共访问器 ==========
@@ -502,7 +564,7 @@ impl DataGrid {
         let global_state = cx.global::<GlobalDbState>().clone();
         let order_by_clause = match build_header_order_by_clause(
             &global_state.db_manager,
-            self.config.database_type,
+            self.config.database_type.clone(),
             column_name,
             sort,
         ) {
@@ -561,13 +623,10 @@ impl DataGrid {
             let result = global_state
                 .query_table_data(cx, connection_id.clone(), request)
                 .await;
-            let columns_info = global_state
-                .list_columns(cx, connection_id, database_name, schema_name, table_name)
-                .await;
 
-            match (result, columns_info) {
-                (Err(err), _) => {
-                    tracing::error!("load_data_with_clauses failed: {}", err);
+            match result {
+                Err(err) => {
+                    error!("load_data_with_clauses failed: {}", err);
                     cx.update(|cx| {
                         table_data_info.update(cx, |info, cx| {
                             info.error_message =
@@ -581,7 +640,7 @@ impl DataGrid {
                         });
                     })
                 }
-                (Ok(response), columns_info_result) => {
+                Ok(response) => {
                     let query_result = response.query_result;
 
                     let (columns, rows, rowids) =
@@ -618,24 +677,21 @@ impl DataGrid {
                             (columns, rows, Vec::new())
                         };
 
-                    let column_meta = match columns_info_result {
-                        Ok(cols) => cols,
-                        Err(_) => query_result
-                            .column_meta
-                            .iter()
-                            .filter(|meta| meta.name != "__rowid__")
-                            .map(|meta| ColumnInfo {
-                                name: meta.name.clone(),
-                                data_type: meta.db_type.clone(),
-                                is_nullable: meta.nullable,
-                                is_primary_key: false,
-                                default_value: None,
-                                comment: None,
-                                charset: None,
-                                collation: None,
-                            })
-                            .collect(),
-                    };
+                    let column_meta: Vec<ColumnInfo> = query_result
+                        .column_meta
+                        .iter()
+                        .filter(|meta| meta.name != "__rowid__")
+                        .map(|meta| ColumnInfo {
+                            name: meta.name.clone(),
+                            data_type: meta.db_type.clone(),
+                            is_nullable: meta.nullable,
+                            is_primary_key: false,
+                            default_value: None,
+                            comment: None,
+                            charset: None,
+                            collation: None,
+                        })
+                        .collect();
 
                     cx.update(|cx| {
                         table_data_info.update(cx, |info, cx| {
@@ -668,6 +724,37 @@ impl DataGrid {
                             state.refresh(cx);
                         });
                     });
+
+                    match global_state
+                        .list_columns(cx, connection_id, database_name, schema_name, table_name)
+                        .await
+                    {
+                        Ok(column_meta) => {
+                            cx.update(|cx| {
+                                table_data_info.update(cx, |info, cx| {
+                                    info.columns = column_meta.clone();
+                                    cx.notify();
+                                });
+
+                                filter_editor.update(cx, |editor, cx| {
+                                    editor.set_schema(
+                                        TableSchema {
+                                            columns: column_meta.clone(),
+                                        },
+                                        cx,
+                                    );
+                                });
+
+                                table.update(cx, |state, cx| {
+                                    state.delegate_mut().set_column_meta(column_meta);
+                                    state.refresh(cx);
+                                });
+                            });
+                        }
+                        Err(err) => {
+                            trace!("load_data_with_clauses list_columns failed: {}", err);
+                        }
+                    }
                 }
             }
         })
@@ -694,9 +781,8 @@ impl DataGrid {
     }
 
     pub fn open_large_text_editor(&self, window: &mut Window, cx: &mut Context<Self>) {
-        match resolve_large_text_editor_route(
-            current_db_view_settings(cx).large_text_editor_open_mode,
-        ) {
+        let settings = cx.global::<AppSettings>();
+        match resolve_large_text_editor_route(settings.large_text_cell_editor_open_mode) {
             LargeTextEditorRoute::PagePreview => {
                 cx.emit(DataGridEvent::ToggleLargeTextEditorRequested);
             }
@@ -1227,6 +1313,15 @@ impl DataGrid {
         self.open_large_text_editor(window, cx);
     }
 
+    fn handle_open_table_designer(
+        &mut self,
+        _: &ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(DataGridEvent::OpenTableDesignerRequested);
+    }
+
     fn handle_toolbar_refresh(
         &mut self,
         _: &ClickEvent,
@@ -1263,11 +1358,13 @@ impl DataGrid {
         };
 
         self.show_text_editor_dialog(
-            target.value,
-            &build_large_text_editor_title(&target.column_name, target.display_row_ix),
-            target.display_row_ix,
-            target.col_ix + 1,
-            target.editable,
+            TextEditorDialogRequest {
+                initial_text: target.value,
+                title: build_large_text_editor_title(&target.column_name, target.display_row_ix),
+                row_ix: target.display_row_ix,
+                col_ix: target.col_ix + 1,
+                editable: target.editable,
+            },
             window,
             cx,
         );
@@ -1324,26 +1421,21 @@ impl DataGrid {
 
     fn show_text_editor_dialog(
         &self,
-        initial_text: String,
-        title: &str,
-        row_ix: usize,
-        col_ix: usize,
-        editable: bool,
+        request: TextEditorDialogRequest,
         window: &mut Window,
         cx: &mut App,
     ) {
         let dialog_text_editor =
-            create_large_text_editor_with_content(Some(initial_text.clone()), window, cx);
+            create_large_text_editor_with_content(Some(request.initial_text.clone()), window, cx);
         let data_grid = self.clone();
-        let title = title.to_string();
 
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let editor = dialog_text_editor.clone();
             let data_grid = data_grid.clone();
-            let original_text = initial_text.clone();
+            let original_text = request.initial_text.clone();
 
             let mut d = dialog
-                .title(SharedString::from(title.clone()))
+                .title(SharedString::from(request.title.clone()))
                 .w(px(800.0))
                 .h(px(600.0))
                 .child(v_flex().w_full().h_full().child(editor.clone()))
@@ -1351,9 +1443,8 @@ impl DataGrid {
                 .overlay(false)
                 .content_center();
 
-            if editable {
+            if request.editable {
                 d = d
-                    .footer(|ok, cancel, window, cx| vec![ok(window, cx), cancel(window, cx)])
                     .on_ok(move |_, window, cx| {
                         if !editor.read(cx).has_pending_writeback() {
                             return true;
@@ -1372,12 +1463,13 @@ impl DataGrid {
                                 });
                                 data_grid.table.update(cx, |state, cx| {
                                     let delegate = state.delegate_mut();
-                                    let Some(actual_row_ix) = delegate.resolve_display_row(row_ix)
+                                    let Some(actual_row_ix) =
+                                        delegate.resolve_display_row(request.row_ix)
                                     else {
                                         return false;
                                     };
 
-                                    let col_index = col_ix.saturating_sub(1);
+                                    let col_index = request.col_ix.saturating_sub(1);
                                     let changed =
                                         delegate.record_cell_change(actual_row_ix, col_index, val);
 
@@ -1397,7 +1489,8 @@ impl DataGrid {
                                 false
                             }
                         };
-                    });
+                    })
+                    .footer(|ok, cancel, window, cx| vec![ok(window, cx), cancel(window, cx)]);
             } else {
                 d = d.footer(|_ok, cancel, window, cx| vec![cancel(window, cx)]);
             }
@@ -1437,7 +1530,8 @@ impl DataGrid {
     }
 
     pub fn has_unsaved_changes(&self, cx: &App) -> bool {
-        !self.get_changes(cx).is_empty()
+        let table = self.table.read(cx);
+        table_has_unsaved_changes(table.editing_cell(), table.delegate().get_changes().len())
     }
 
     // ========== 复制为 SQL 语句 ==========
@@ -1703,16 +1797,22 @@ impl DataGrid {
     }
 
     pub fn save_changes(&self, window: &mut Window, cx: &mut App) {
-        self.handle_save_changes(&gpui::ClickEvent::default(), window, cx);
+        self.table.update(cx, |state, cx| {
+            state.commit_cell_edit(window, cx);
+        });
+        self.handle_save_changes(&ClickEvent::default(), window, cx);
     }
 
     pub fn save_and_close(
         &self,
         tab_container: Entity<TabContainer>,
         tab_id: String,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) {
+        self.table.update(cx, |state, cx| {
+            state.commit_cell_edit(window, cx);
+        });
         let changes = self.get_changes(cx);
         if changes.is_empty() {
             if let Some(window_id) = cx.active_window() {
@@ -1730,7 +1830,7 @@ impl DataGrid {
         let database_name = self.config.database_name.clone();
         let schema_name = self.config.schema_name.clone();
         let table_name = self.config.table_name.clone();
-        let database_type = self.config.database_type;
+        let database_type = self.config.database_type.clone();
         let this = self.clone();
         let delegate = self.table.read(cx).delegate();
         let columns = delegate.column_meta.clone();
@@ -1865,7 +1965,7 @@ impl DataGrid {
         let database_name = self.config.database_name.clone();
         let schema_name = self.config.schema_name.clone();
         let table_name = self.config.table_name.clone();
-        let database_type = self.config.database_type;
+        let database_type = self.config.database_type.clone();
         let this = self.clone();
         let delegate = self.table.read(cx).delegate();
         let columns = delegate.column_meta.clone();
@@ -2100,7 +2200,6 @@ impl DataGrid {
                     DialogButtonProps::default()
                         .ok_text(t!("TableDataGrid.execute_sql").to_string()),
                 )
-                .footer(|ok, cancel, window, cx| vec![ok(window, cx), cancel(window, cx)])
                 .on_ok(move |_, window, cx| {
                     let sql_text = editor.read(cx).get_text(cx);
                     if sql_text.trim().is_empty() {
@@ -2117,6 +2216,7 @@ impl DataGrid {
                     );
                     false
                 })
+                .footer(|ok, cancel, window, cx| vec![ok(window, cx), cancel(window, cx)])
         });
     }
 
@@ -2234,8 +2334,9 @@ impl DataGrid {
         let editable = self.config.editable;
         let loading = self.table.read(cx).delegate().is_loading();
         let data_grid = cx.entity().clone();
-        let large_text_button_selected = current_db_view_settings(cx).large_text_editor_open_mode
-            == LargeTextEditorOpenMode::SidebarPreview
+        let settings = cx.global::<AppSettings>();
+        let large_text_button_selected = settings.large_text_cell_editor_open_mode
+            == LargeTextCellEditorOpenMode::SidebarPreview
             && self.is_large_text_editor_sidebar_open;
 
         h_flex()
@@ -2305,6 +2406,32 @@ impl DataGrid {
                 )
             })
             .child(div().flex_1())
+            .when(self.config.usage == DataGridUsage::TableData, |this| {
+                this.child(
+                    div().w(px(220.)).child(
+                        Input::new(&self.search_input)
+                            .prefix(
+                                Icon::new(IconName::Search).text_color(cx.theme().muted_foreground),
+                            )
+                            .cleanable(true)
+                            .small()
+                            .w_full(),
+                    ),
+                )
+            })
+            .when(
+                self.config.usage == DataGridUsage::TableData && editable,
+                |this| {
+                    this.child(
+                        Button::new("open-table-designer")
+                            .with_size(Size::Medium)
+                            .icon(IconName::TableDesignTool)
+                            .tooltip(t!("TableDataGrid.open_table_designer").to_string())
+                            .disabled(loading)
+                            .on_click(cx.listener(Self::handle_open_table_designer)),
+                    )
+                },
+            )
             .child(
                 Button::new("toggle-editor")
                     .with_size(Size::Medium)
@@ -2528,7 +2655,7 @@ impl DataGrid {
                         Button::new("page-size-selector")
                             .with_size(Size::Small)
                             .label(label)
-                            .dropdown_menu_with_anchor(Corner::TopRight, move |menu, _, _| {
+                            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                                 menu.menu("500", Box::new(Page500))
                                     .menu("1000", Box::new(Page1000))
                                     .menu("2000", Box::new(Page2000))
@@ -2549,7 +2676,7 @@ impl DataGrid {
     fn render_simple_status_bar(&self, cx: &App) -> AnyElement {
         let row_count = self.config.rows_count;
         // 将SQL中的换行符替换为空格，保持单行显示
-        let sql = self.config.sql.replace('\n', " ").replace('\r', " ");
+        let sql = self.config.sql.replace(['\n', '\r'], " ");
         let execution_time = self.config.execution_time;
 
         h_flex()
@@ -2598,9 +2725,12 @@ impl Render for DataGrid {
                     .on_action(cx.listener(Self::handle_page_change_2000))
                     .on_action(cx.listener(Self::handle_page_change_10000))
                     .on_action(cx.listener(Self::handle_page_change_100000))
+                    .on_action(cx.listener(Self::on_action_focus_search))
+                    .key_context(DB_SEARCH_CONTEXT)
             })
             .size_full()
             .gap_0()
+            .track_focus(&self.focus_handle)
             .child(self.render_toolbar(window, cx))
             .when(is_table_data, |this| {
                 this.child(
@@ -2637,6 +2767,8 @@ impl Clone for DataGrid {
             table_data_info: self.table_data_info.clone(),
             filter_editor: self.filter_editor.clone(),
             _filter_sub: None,
+            search_input: self.search_input.clone(),
+            _search_sub: None,
             is_large_text_editor_sidebar_open: self.is_large_text_editor_sidebar_open,
         }
     }
@@ -2662,10 +2794,11 @@ mod tests {
     use super::{
         ExportFormat, LargeTextEditorRoute, TableMetadata, build_header_order_by_clause,
         build_large_text_editor_title, collect_delete_row_indices, resolve_large_text_editor_route,
+        table_has_unsaved_changes,
     };
-    use crate::settings::LargeTextEditorOpenMode;
     use db::DbManager;
     use gpui::SharedString;
+    use one_core::settings::LargeTextCellEditorOpenMode;
     use one_core::storage::DatabaseType;
     use one_ui::edit_table::ColumnSort;
     use rust_i18n::t;
@@ -2680,6 +2813,21 @@ mod tests {
         let columns = vec![SharedString::from("id"), SharedString::from("body")];
         let metadata = TableMetadata::new("news").with_columns(vec!["id", "body"]);
         (rows, columns, metadata)
+    }
+
+    #[test]
+    fn table_has_unsaved_changes_when_cell_is_still_editing() {
+        assert!(table_has_unsaved_changes(Some((0, 1)), 0));
+    }
+
+    #[test]
+    fn table_has_unsaved_changes_when_delegate_has_pending_changes() {
+        assert!(table_has_unsaved_changes(None, 1));
+    }
+
+    #[test]
+    fn table_has_no_unsaved_changes_without_editing_or_pending_changes() {
+        assert!(!table_has_unsaved_changes(None, 0));
     }
 
     fn read_xlsx_entry(bytes: &[u8], entry_name: &str) -> String {
@@ -2767,16 +2915,37 @@ mod tests {
 
     #[test]
     fn resolve_large_text_editor_route_uses_page_preview_for_sidebar_mode() {
-        let route = resolve_large_text_editor_route(LargeTextEditorOpenMode::SidebarPreview);
+        let route = resolve_large_text_editor_route(LargeTextCellEditorOpenMode::SidebarPreview);
 
         assert_eq!(route, LargeTextEditorRoute::PagePreview);
     }
 
     #[test]
     fn resolve_large_text_editor_route_uses_dialog_for_dialog_mode() {
-        let route = resolve_large_text_editor_route(LargeTextEditorOpenMode::Dialog);
+        let route = resolve_large_text_editor_route(LargeTextCellEditorOpenMode::Dialog);
 
         assert_eq!(route, LargeTextEditorRoute::Dialog);
+    }
+
+    #[test]
+    fn dialog_custom_footers_capture_latest_callbacks() {
+        let source = include_str!("data_grid.rs");
+        assert_dialog_footer_after_callback(source, "fn show_text_editor_dialog(");
+        assert_dialog_footer_after_callback(source, "fn show_sql_editor_dialog(");
+    }
+
+    fn assert_dialog_footer_after_callback(source: &str, marker: &str) {
+        let start = source.find(marker).expect("function exists");
+        let rest = &source[start..];
+        let end = rest.find("\n    fn ").unwrap_or(rest.len());
+        let body = &rest[..end];
+        let on_ok = body.find(".on_ok(").expect("function binds ok callback");
+        let footer = body.find(".footer(").expect("function uses custom footer");
+
+        assert!(
+            on_ok < footer,
+            "{marker} must bind dialog callbacks before building custom footer buttons"
+        );
     }
 
     #[test]

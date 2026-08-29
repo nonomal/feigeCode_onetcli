@@ -1,10 +1,13 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
 pub mod addon;
+pub mod broadcast_input;
 pub mod cd_completion;
 pub mod highlight_presets;
 pub mod history_prompt;
 pub mod keys;
+pub mod public_mcp;
+pub mod public_mcp_remote_ops;
 pub mod serial_form_window;
 pub mod settings;
 pub mod sidebar;
@@ -23,11 +26,11 @@ pub use settings::{
     TerminalHighlightRule, TerminalSettings, current_settings, init_settings, update_settings,
 };
 pub use sidebar::{SettingsPanel, SidebarPanel, TerminalSidebar, TerminalSidebarEvent};
-pub use ssh_form_window::{SshFormWindow, SshFormWindowConfig};
+pub use ssh_form_window::{SshFormPostSaveAction, SshFormWindow, SshFormWindowConfig};
 pub use terminal::terminal::{
     ConnectionState, SshTerminalConfig, Terminal, TerminalConnectionKind, TerminalModelEvent,
 };
 pub use theme::{
     DEFAULT_LINE_HEIGHT_SCALE, MAX_FONT_SIZE, MIN_FONT_SIZE, TerminalTheme, default_font_fallbacks,
 };
-pub use view::{TerminalView, init};
+pub use view::{TerminalView, init, refresh_keybindings};

@@ -6,9 +6,9 @@ use db::sql_editor::sql_context_inferrer::{ContextInferrer, SqlContext as Inferr
 use db::sql_editor::sql_symbol_table::SymbolTable;
 use db::sql_editor::sql_tokenizer::SqlTokenizer;
 use gpui::{
-    App, AppContext, Context, Entity, IntoElement, Render, Styled as _, Subscription, Task, Window,
+    App, AppContext, Context, Entity, Font, IntoElement, Render, Styled as _,
+    Subscription, Task, Window,
 };
-use gpui_component::highlighter::Language;
 use gpui_component::input::{
     CodeActionProvider, CompletionProvider, HoverProvider, Input, InputContextMenuItem, InputEvent,
     InputState, TabSize,
@@ -19,14 +19,16 @@ use lsp_types::{
     InlineCompletionContext, InlineCompletionItem, InlineCompletionResponse, InsertReplaceEdit,
     InsertTextFormat, Range as LspRange,
 };
+use one_core::settings::{installed_grid_monospace_font, AppSettings};
 use rust_i18n::t;
 use sum_tree::Bias;
 
 /// Simple schema hints to improve autocomplete suggestions.
 #[derive(Clone, Default)]
 pub struct SqlSchema {
-    pub tables: Vec<(String, String)>,  // (name, doc)
-    pub columns: Vec<(String, String)>, // global (name, doc)
+    pub tables: Vec<(String, String)>,    // (name, doc)
+    pub columns: Vec<(String, String)>,   // global (name, doc)
+    pub functions: Vec<(String, String)>, // (signature, doc)
     /// 表→列映射，每列包含 (name, data_type, doc)
     pub columns_by_table: std::collections::HashMap<String, Vec<(String, String, String)>>,
 }
@@ -47,6 +49,16 @@ impl SqlSchema {
         columns: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
     ) -> Self {
         self.columns = columns
+            .into_iter()
+            .map(|(n, d)| (n.into(), d.into()))
+            .collect();
+        self
+    }
+    pub fn with_functions(
+        mut self,
+        functions: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.functions = functions
             .into_iter()
             .map(|(n, d)| (n.into(), d.into()))
             .collect();
@@ -199,7 +211,7 @@ pub mod completion_priority {
     /// Format: "{score:05}_{label}" for stable sorting.
     pub fn score_to_sort_text(score: i32, label: &str) -> String {
         // Lower score = higher priority, so use score directly
-        format!("{:05}_{}", score.max(0).min(99999), label)
+        format!("{:05}_{}", score.clamp(0, 99999), label)
     }
 }
 
@@ -882,6 +894,34 @@ impl CompletionProvider for DefaultSqlCompletionProvider {
 
             // Functions - priority based on context (Requirement 5.3)
             if show_functions {
+                for (func, doc) in &schema.functions {
+                    let func_name = func.split('(').next().unwrap_or("");
+                    if matches_filter(func_name) {
+                        let matches_prefix = !current_word.is_empty()
+                            && func_name.to_uppercase().starts_with(&current_word);
+                        let score = completion_priority::calculate_score(
+                            &context,
+                            Some(CompletionItemKind::FUNCTION),
+                            matches_prefix,
+                        );
+                        items.push(CompletionItem {
+                            label: func.to_string(),
+                            kind: Some(CompletionItemKind::FUNCTION),
+                            text_edit: Some(CompletionTextEdit::InsertAndReplace(
+                                InsertReplaceEdit {
+                                    new_text: func.to_string(),
+                                    insert: replace_range,
+                                    replace: replace_range,
+                                },
+                            )),
+                            filter_text: Some(matched_prefix(func_name)),
+                            documentation: Some(lsp_types::Documentation::String(doc.to_string())),
+                            sort_text: Some(completion_priority::score_to_sort_text(score, func)),
+                            ..Default::default()
+                        });
+                    }
+                }
+
                 // Standard SQL functions
                 for (func, doc) in SQL_FUNCTIONS {
                     let func_name = func.split('(').next().unwrap_or("");
@@ -1321,13 +1361,19 @@ impl CompletionProvider for TableMentionCompletionProvider {
 pub struct SqlEditor {
     editor: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
+    font_cache: Option<SqlEditorFontCache>,
+}
+
+struct SqlEditorFontCache {
+    requested_family: String,
+    font: Font,
 }
 
 impl SqlEditor {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(|cx| {
             let mut editor = InputState::new(window, cx)
-                .code_editor(Language::Sql)
+                .code_editor("sql")
                 .line_number(true)
                 .searchable(true)
                 .indent_guides(true)
@@ -1356,7 +1402,25 @@ impl SqlEditor {
         Self {
             editor,
             _subscriptions,
+            font_cache: None,
         }
+    }
+
+    fn editor_font(&mut self, cx: &mut Context<Self>) -> Font {
+        let font_family = AppSettings::global(cx).sql_editor_font_family.clone();
+        if let Some(cache) = &self.font_cache
+            && cache.requested_family == font_family
+        {
+            return cache.font.clone();
+        }
+
+        let installed_font_names = cx.text_system().all_font_names();
+        let font = installed_grid_monospace_font(&font_family, &installed_font_names);
+        self.font_cache = Some(SqlEditorFontCache {
+            requested_family: font_family,
+            font: font.clone(),
+        });
+        font
     }
 
     /// Set database-specific completion information from plugin
@@ -1471,10 +1535,46 @@ impl SqlEditor {
     pub fn get_selected_text(&self, cx: &App) -> String {
         self.editor.read(cx).selected_text_string()
     }
+
+    /// Get the current cursor byte offset.
+    pub fn cursor_offset(&self, cx: &App) -> usize {
+        self.editor.read(cx).cursor()
+    }
 }
 
 impl Render for SqlEditor {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        Input::new(&self.editor).size_full()
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let font = self.editor_font(cx);
+        Input::new(&self.editor).font(font).size_full()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sql_editor_render_uses_cached_font() {
+        let source = include_str!("sql_editor.rs");
+        let editor_font = source
+            .split("fn editor_font(")
+            .nth(1)
+            .expect("editor_font helper exists")
+            .split("/// Set database-specific completion information")
+            .next()
+            .expect("editor_font helper has an end marker");
+        let render = source
+            .split("impl Render for SqlEditor")
+            .nth(1)
+            .expect("SqlEditor render impl exists")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("SqlEditor render impl has an end marker");
+
+        assert!(editor_font.contains("cache.requested_family == font_family"));
+        assert!(editor_font.contains("cx.text_system().all_font_names()"));
+        assert!(editor_font.contains("installed_grid_monospace_font("));
+        assert!(!editor_font.contains("installed_business_grid_monospace_font("));
+        assert!(!editor_font.contains("cache.installed_font_names == installed_font_names"));
+        assert!(!editor_font.contains("installed_font_names,"));
+        assert!(!render.contains("cx.text_system().all_font_names()"));
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "main"
-version = "0.4.6"
+version = "0.8.7"
 publish.workspace = true
 edition.workspace = true
 
@@ -10,7 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 gpui = { workspace = true }
-gpui-component = { workspace = true }
+gpui_platform = { workspace = true }
+gpui-component = { workspace = true, features = ["tree-sitter-bash", "tree-sitter-sql"] }
 gpui-component-assets = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -22,29 +23,58 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 rust-i18n = { workspace = true }
 base64 = { workspace = true }
+percent-encoding = { workspace = true }
 dirs = {workspace = true}
 futures = { workspace = true }
 smol = { workspace = true }
 db_view = { workspace = true }
+extension-runtime = { workspace = true, features = ["wasm-components"] }
+extension_view = { workspace = true }
 terminal = { workspace = true }
 terminal_view = { workspace = true }
+agent_runtime = { workspace = true }
+ai_chat_view = { workspace = true }
+public_mcp = { workspace = true }
+tool_runtime = { workspace = true }
+port_forwarding = { workspace = true }
+port_forwarding_view = { workspace = true }
 sftp_view = { workspace = true }
 redis_view = { workspace = true }
 mongodb_view = { workspace = true }
+remote_desktop = { workspace = true }
+remote_desktop_view = { workspace = true }
+remote_file_editor = { workspace = true }
 one-core.workspace = true
 one-ui.workspace = true
+onetcli_runtime.workspace = true
 reqwest_client.workspace = true
 db.workspace = true
+connection-import-protocol.workspace = true
 global-hotkey.workspace = true
 sha2 = { workspace = true }
 flate2 = "1"
 tar = "0.4"
+raw-window-handle = { workspace = true }
+font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "110523127440aefb11ce0cf280ae7c5071337ec5", package = "zed-font-kit", version = "0.14.1-zed" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 zip = { version = "2", default-features = false, features = ["deflate"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winresource = "0.1"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+tempfile = "3"
+
+[features]
+default = ["wasm-components"]
+builtin-duckdb = ["db/builtin-duckdb", "db_view/builtin-duckdb", "onetcli_runtime/builtin-duckdb"]
+github-distribution = ["github-updates", "github-marketplace"]
+github-marketplace = ["extension-runtime/github-marketplace"]
+github-updates = []
+wasm-components = ["extension-runtime/wasm-components"]
 
 [lints]
 workspace = true

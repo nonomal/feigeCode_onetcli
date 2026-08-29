@@ -4,26 +4,23 @@ version = "0.1.0"
 publish.workspace = true
 edition.workspace = true
 
-[features]
-default = []
-ui = [
-    "dep:gpui",
-    "dep:gpui-component",
-    "dep:one-core",
-    "dep:sftp",
-    "dep:tokio",
-    "dep:tracing",
-]
-
 [dependencies]
 anyhow = { workspace = true }
-gpui = { workspace = true, optional = true }
-gpui-component = { workspace = true, optional = true }
-one-core = { workspace = true, optional = true }
+extension-runtime = { workspace = true }
+futures = { workspace = true }
+gpui = { workspace = true}
+gpui-component = { workspace = true }
+notify = { workspace = true }
+one-core = { workspace = true }
+process-util = { workspace = true }
 rust-i18n.workspace = true
-sftp = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
-tracing = { workspace = true, optional = true }
+sftp = { workspace = true }
+smol = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

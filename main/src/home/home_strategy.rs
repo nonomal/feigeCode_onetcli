@@ -1,9 +1,17 @@
 use crate::home_tab::HomePage;
 use gpui::{Context, Window};
 use one_core::storage::{ConnectionType, StoredConnection, Workspace};
+use one_core::tab_container::TabOpenMode;
+use remote_desktop::RemoteDesktopProtocol;
 
 pub(crate) trait ConnectionOpenStrategy {
-    fn open(self: Box<Self>, home: &mut HomePage, window: &mut Window, cx: &mut Context<HomePage>);
+    fn open(
+        self: Box<Self>,
+        home: &mut HomePage,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<HomePage>,
+    );
 }
 
 pub(crate) fn build_connection_open_strategy(
@@ -25,6 +33,15 @@ pub(crate) fn build_connection_open_strategy(
             workspace,
         }),
         ConnectionType::Serial => Box::new(SerialOpenStrategy { connection }),
+        ConnectionType::PortForwarding => Box::new(PortForwardingOpenStrategy { connection }),
+        ConnectionType::Rdp => Box::new(RemoteDesktopOpenStrategy {
+            connection,
+            protocol: RemoteDesktopProtocol::Rdp,
+        }),
+        ConnectionType::Vnc => Box::new(RemoteDesktopOpenStrategy {
+            connection,
+            protocol: RemoteDesktopProtocol::Vnc,
+        }),
         _ => Box::new(NoopOpenStrategy),
     }
 }
@@ -34,8 +51,14 @@ struct SshOpenStrategy {
 }
 
 impl ConnectionOpenStrategy for SshOpenStrategy {
-    fn open(self: Box<Self>, home: &mut HomePage, window: &mut Window, cx: &mut Context<HomePage>) {
-        home.open_ssh_terminal(self.connection, window, cx);
+    fn open(
+        self: Box<Self>,
+        home: &mut HomePage,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<HomePage>,
+    ) {
+        home.open_ssh_terminal_with_mode(self.connection, mode, window, cx);
     }
 }
 
@@ -45,12 +68,48 @@ struct DatabaseOpenStrategy {
 }
 
 impl ConnectionOpenStrategy for DatabaseOpenStrategy {
-    fn open(self: Box<Self>, home: &mut HomePage, window: &mut Window, cx: &mut Context<HomePage>) {
+    fn open(
+        self: Box<Self>,
+        home: &mut HomePage,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<HomePage>,
+    ) {
         let DatabaseOpenStrategy {
             connection,
             workspace,
         } = *self;
-        home.add_item_to_tab(&connection, workspace, window, cx);
+        extension_runtime::database_driver_install::open_database_connection_with_driver_guard(
+            home, connection, workspace, mode, window, cx,
+        );
+    }
+}
+
+impl extension_runtime::remote_desktop_provider_install::RemoteDesktopConnectionOpener
+    for HomePage
+{
+    fn open_remote_desktop_connection(
+        &mut self,
+        connection: &StoredConnection,
+        protocol: RemoteDesktopProtocol,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_remote_desktop_with_mode(connection.clone(), protocol, mode, window, cx);
+    }
+}
+
+impl extension_runtime::database_driver_install::DatabaseDriverConnectionOpener for HomePage {
+    fn open_database_connection(
+        &mut self,
+        connection: &StoredConnection,
+        workspace: Option<Workspace>,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.add_item_to_tab_with_mode(connection, workspace, mode, window, cx);
     }
 }
 
@@ -60,12 +119,18 @@ struct RedisOpenStrategy {
 }
 
 impl ConnectionOpenStrategy for RedisOpenStrategy {
-    fn open(self: Box<Self>, home: &mut HomePage, window: &mut Window, cx: &mut Context<HomePage>) {
+    fn open(
+        self: Box<Self>,
+        home: &mut HomePage,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<HomePage>,
+    ) {
         let RedisOpenStrategy {
             connection,
             workspace,
         } = *self;
-        home.open_redis_tab(connection, workspace, window, cx);
+        home.open_redis_tab_with_mode(connection, workspace, mode, window, cx);
     }
 }
 
@@ -75,12 +140,18 @@ struct MongoOpenStrategy {
 }
 
 impl ConnectionOpenStrategy for MongoOpenStrategy {
-    fn open(self: Box<Self>, home: &mut HomePage, window: &mut Window, cx: &mut Context<HomePage>) {
+    fn open(
+        self: Box<Self>,
+        home: &mut HomePage,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<HomePage>,
+    ) {
         let MongoOpenStrategy {
             connection,
             workspace,
         } = *self;
-        home.open_mongodb_tab(connection, workspace, window, cx);
+        home.open_mongodb_tab_with_mode(connection, workspace, mode, window, cx);
     }
 }
 
@@ -91,8 +162,53 @@ struct SerialOpenStrategy {
 }
 
 impl ConnectionOpenStrategy for SerialOpenStrategy {
-    fn open(self: Box<Self>, home: &mut HomePage, window: &mut Window, cx: &mut Context<HomePage>) {
-        home.open_serial_terminal(self.connection, window, cx);
+    fn open(
+        self: Box<Self>,
+        home: &mut HomePage,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<HomePage>,
+    ) {
+        home.open_serial_terminal_with_mode(self.connection, mode, window, cx);
+    }
+}
+
+struct PortForwardingOpenStrategy {
+    connection: StoredConnection,
+}
+
+impl ConnectionOpenStrategy for PortForwardingOpenStrategy {
+    fn open(
+        self: Box<Self>,
+        home: &mut HomePage,
+        _mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<HomePage>,
+    ) {
+        home.open_port_forwarding(self.connection, window, cx);
+    }
+}
+
+struct RemoteDesktopOpenStrategy {
+    connection: StoredConnection,
+    protocol: RemoteDesktopProtocol,
+}
+
+impl ConnectionOpenStrategy for RemoteDesktopOpenStrategy {
+    fn open(
+        self: Box<Self>,
+        home: &mut HomePage,
+        mode: TabOpenMode,
+        window: &mut Window,
+        cx: &mut Context<HomePage>,
+    ) {
+        let RemoteDesktopOpenStrategy {
+            connection,
+            protocol,
+        } = *self;
+        extension_runtime::remote_desktop_provider_install::open_remote_desktop_connection_with_provider_guard(
+            home, connection, protocol, mode, window, cx,
+        );
     }
 }
 
@@ -100,6 +216,7 @@ impl ConnectionOpenStrategy for NoopOpenStrategy {
     fn open(
         self: Box<Self>,
         _home: &mut HomePage,
+        _mode: TabOpenMode,
         _window: &mut Window,
         _cx: &mut Context<HomePage>,
     ) {

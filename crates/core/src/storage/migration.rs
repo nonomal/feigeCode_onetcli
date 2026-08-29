@@ -14,6 +14,42 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "20260317000001",
         include_str!("../../migrations/20260317000001_connection_owner.sql"),
     ),
+    (
+        "20260610000001",
+        include_str!("../../migrations/20260610000001_sftp_favorite_paths.sql"),
+    ),
+    (
+        "20260618000001",
+        include_str!("../../migrations/20260618000001_connection_last_used.sql"),
+    ),
+    (
+        "20260623000001",
+        include_str!("../../migrations/20260623000001_connection_sort_order.sql"),
+    ),
+    (
+        "20260626000001",
+        include_str!("../../migrations/20260626000001_personal_sync.sql"),
+    ),
+    (
+        "20260630000001",
+        include_str!("../../migrations/20260630000001_agent_sessions.sql"),
+    ),
+    (
+        "20260630000002",
+        include_str!("../../migrations/20260630000002_team_key_verification_cache.sql"),
+    ),
+    (
+        "20260704000001",
+        include_str!("../../migrations/20260704000001_workspace_sort_order.sql"),
+    ),
+    (
+        "20260704000002",
+        include_str!("../../migrations/20260704000002_workspace_last_synced_at.sql"),
+    ),
+    (
+        "20260705000001",
+        include_str!("../../migrations/20260705000001_terminal_command_history.sql"),
+    ),
 ];
 
 pub fn run_migrations(conn: &Connection) -> Result<()> {

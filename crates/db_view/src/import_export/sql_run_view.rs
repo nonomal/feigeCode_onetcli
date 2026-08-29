@@ -9,7 +9,7 @@ use gpui::{
     prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, Sizable, TitleBar, VirtualListScrollHandle,
+    ActiveTheme, Disableable, Sizable, VirtualListScrollHandle,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
@@ -109,6 +109,10 @@ impl SqlRunView {
         });
     }
 
+    fn should_show_start_button(is_running: bool) -> bool {
+        !is_running
+    }
+
     fn select_file(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let pending = self.pending_file_path.clone();
         let logs = self.logs.clone();
@@ -155,6 +159,10 @@ impl SqlRunView {
 
         self.is_running.update(cx, |r, cx| {
             *r = true;
+            cx.notify();
+        });
+        self.is_finished.update(cx, |f, cx| {
+            *f = false;
             cx.notify();
         });
 
@@ -570,7 +578,7 @@ impl Render for SqlRunView {
                                 let short_file_len = entry
                                     .file
                                     .split('/')
-                                    .last()
+                                    .next_back()
                                     .map(|s| s.len())
                                     .unwrap_or(entry.file.len());
                                 short_file_len + entry.message.len() + 8
@@ -609,7 +617,7 @@ impl Render for SqlRunView {
                                                 let short_file = entry
                                                     .file
                                                     .split('/')
-                                                    .last()
+                                                    .next_back()
                                                     .unwrap_or(&entry.file);
                                                 format!("[RUN] {}> {}", short_file, entry.message)
                                             };
@@ -657,7 +665,7 @@ impl Render for SqlRunView {
                     .pt_2()
                     .gap_2()
                     .justify_end()
-                    .when(!is_running && !is_finished, |this| {
+                    .when(Self::should_show_start_button(is_running), |this| {
                         this.child(
                             Button::new("start")
                                 .primary()
@@ -688,10 +696,21 @@ impl Render for SqlRunView {
                     }),
             );
 
-        v_flex()
-            .w_full()
-            .h(px(520.0))
-            .child(TitleBar::new())
-            .child(content)
+        v_flex().w_full().h(px(520.0)).child(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_button_is_visible_after_sql_run_finishes() {
+        assert!(SqlRunView::should_show_start_button(false));
+    }
+
+    #[test]
+    fn start_button_is_hidden_while_sql_run_is_running() {
+        assert!(!SqlRunView::should_show_start_button(true));
     }
 }

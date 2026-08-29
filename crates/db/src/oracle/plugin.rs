@@ -2,8 +2,9 @@ use std::collections::HashMap;
 
 use std::sync::LazyLock;
 
+use crate::types::ObjectViewColumn as Column;
 use anyhow::Result;
-use gpui_component::table::Column;
+use chrono::{DateTime, FixedOffset};
 use one_core::storage::{DatabaseType, DbConnectionConfig};
 use rust_i18n::t;
 
@@ -15,16 +16,18 @@ use crate::import_export::{
     ImportResult,
 };
 use crate::manifest_helpers::{
-    DatabaseActionDescriptorExt, action, action_with_scope, field, option, ssh_auth_rules,
-    ssh_enabled_rules, ssh_field, ssh_number_field, ssh_password_field, tab, yes_no_options,
+    DatabaseActionDescriptorExt, action, action_with_scope, field, option,
+    schema_preference_fields, ssh_auth_rules, ssh_enabled_rules, ssh_field, ssh_number_field,
+    ssh_password_field, tab, yes_no_options,
 };
 use crate::oracle::connection::OracleDbConnection;
-use crate::plugin::{DatabasePlugin, SqlCompletionInfo};
+use crate::plugin::{DatabasePlugin, DatabaseUserOperationRequest, SqlCompletionInfo};
 use crate::plugin_manifest::{
     DatabaseActionId, DatabaseActionManifest, DatabaseActionPlacement, DatabaseActionToolbarScope,
     DatabaseCapabilities, DatabaseFormFieldType, DatabaseFormKind, DatabaseFormManifest,
     DatabaseUiCapabilities, DatabaseUiManifest,
 };
+use crate::schema_preferences::{SchemaFilterProfile, filter_schemas};
 use crate::types::*;
 
 /// Oracle data types (name, description)
@@ -61,17 +64,474 @@ pub const ORACLE_DATA_TYPES: &[(&str, &str)] = &[
 pub struct OraclePlugin;
 
 static ORACLE_UI_MANIFEST: LazyLock<DatabaseUiManifest> = LazyLock::new(build_oracle_ui_manifest);
+const ORACLE_SQL_LITERAL_CHUNK_BYTES: usize = 3000;
+const ORACLE_DATE_FORMAT: &str = "YYYY-MM-DD";
+const ORACLE_DATETIME_FORMAT: &str = "YYYY-MM-DD HH24:MI:SS";
+const ORACLE_DATETIME_FRACTION_FORMAT: &str = "YYYY-MM-DD HH24:MI:SS.FF6";
+const ORACLE_DATETIME_TZ_FORMAT: &str = "YYYY-MM-DD HH24:MI:SS TZH:TZM";
+const ORACLE_DATETIME_TZ_FRACTION_FORMAT: &str = "YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM";
 
 impl OraclePlugin {
     pub fn new() -> Self {
         Self
     }
+
+    fn comment_literal(comment: &str) -> String {
+        format!("'{}'", comment.replace('\'', "''"))
+    }
+
+    fn table_comment_sql(&self, table_name: &str, comment: &str) -> String {
+        format!(
+            "COMMENT ON TABLE {} IS {};",
+            self.quote_identifier(table_name),
+            Self::comment_literal(comment)
+        )
+    }
+
+    fn column_comment_sql(&self, table_name: &str, column_name: &str, comment: &str) -> String {
+        format!(
+            "COMMENT ON COLUMN {}.{} IS {};",
+            self.quote_identifier(table_name),
+            self.quote_identifier(column_name),
+            Self::comment_literal(comment)
+        )
+    }
+
+    fn design_comment_sql(&self, design: &TableDesign) -> Vec<String> {
+        let mut statements = Vec::new();
+        if !design.options.comment.is_empty() {
+            statements.push(self.table_comment_sql(&design.table_name, &design.options.comment));
+        }
+        statements.extend(
+            design
+                .columns
+                .iter()
+                .filter(|column| !column.comment.is_empty())
+                .map(|column| {
+                    self.column_comment_sql(&design.table_name, &column.name, &column.comment)
+                }),
+        );
+        statements
+    }
+
+    fn foreign_key_delete_action_sql(action: &str) -> Option<String> {
+        let action = action
+            .trim()
+            .split_whitespace()
+            .map(str::to_ascii_uppercase)
+            .collect::<Vec<_>>()
+            .join(" ");
+        match action.as_str() {
+            "CASCADE" | "SET NULL" => Some(action),
+            _ => None,
+        }
+    }
+
+    fn table_change_value_expr(&self, value: &str, column: Option<&ColumnInfo>) -> String {
+        if value == "NULL" || value.is_empty() {
+            return "NULL".to_string();
+        }
+
+        if let Some(expr) = oracle_temporal_value_expr(value, column) {
+            return expr;
+        }
+
+        if is_oracle_lob_column(column) {
+            return oracle_lob_literal_expr(value, column);
+        }
+
+        if escaped_sql_literal_len(value) > ORACLE_SQL_LITERAL_CHUNK_BYTES {
+            return oracle_chunked_string_literal_expr(value);
+        }
+
+        oracle_string_literal(value)
+    }
+
+    fn build_oracle_table_change_sql(
+        &self,
+        request: &TableSaveRequest,
+        change: &TableRowChange,
+    ) -> Option<String> {
+        match change {
+            TableRowChange::Added { .. } => self.build_oracle_added_sql(request, change),
+            TableRowChange::Updated { .. } => self.build_oracle_updated_sql(request, change),
+            TableRowChange::Deleted { .. } => self.build_oracle_deleted_sql(request, change),
+        }
+    }
+
+    fn oracle_table_ident(&self, request: &TableSaveRequest) -> String {
+        self.format_table_reference(&request.database, request.schema.as_deref(), &request.table)
+    }
+
+    fn build_oracle_added_sql(
+        &self,
+        request: &TableSaveRequest,
+        change: &TableRowChange,
+    ) -> Option<String> {
+        let TableRowChange::Added { data } = change else {
+            return None;
+        };
+        if data.is_empty() {
+            return None;
+        }
+
+        let columns: Vec<String> = request
+            .columns
+            .iter()
+            .map(|column| self.quote_identifier(&column.name))
+            .collect();
+        let values: Vec<String> = data
+            .iter()
+            .enumerate()
+            .map(|(ix, value)| self.table_change_value_expr(value, request.columns.get(ix)))
+            .collect();
+
+        Some(format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            self.oracle_table_ident(request),
+            columns.join(", "),
+            values.join(", ")
+        ))
+    }
+
+    fn build_oracle_updated_sql(
+        &self,
+        request: &TableSaveRequest,
+        change: &TableRowChange,
+    ) -> Option<String> {
+        let TableRowChange::Updated {
+            original_data,
+            changes,
+            rowid,
+        } = change
+        else {
+            return None;
+        };
+        if changes.is_empty() {
+            return None;
+        }
+
+        let set_clause = self.oracle_update_set_clause(request, changes);
+        if let Some(rid) = rowid {
+            return Some(format!(
+                "UPDATE {} SET {} WHERE {} = {}",
+                self.oracle_table_ident(request),
+                set_clause.join(", "),
+                self.rowid_column_name(),
+                oracle_string_literal(rid)
+            ));
+        }
+
+        let (where_clause, limit_clause) =
+            self.build_where_and_limit_clause(request, original_data);
+        Some(format!(
+            "UPDATE {} SET {}{}{}{}",
+            self.oracle_table_ident(request),
+            set_clause.join(", "),
+            if where_clause.is_empty() {
+                ""
+            } else {
+                " WHERE "
+            },
+            where_clause,
+            limit_clause
+        ))
+    }
+
+    fn oracle_update_set_clause(
+        &self,
+        request: &TableSaveRequest,
+        changes: &[TableCellChange],
+    ) -> Vec<String> {
+        changes
+            .iter()
+            .map(|change| {
+                let column_name = self.oracle_change_column_name(request, change);
+                let ident = self.quote_identifier(&column_name);
+                let value = self.table_change_value_expr(
+                    &change.new_value,
+                    request.columns.get(change.column_index),
+                );
+                format!("{} = {}", ident, value)
+            })
+            .collect()
+    }
+
+    fn oracle_change_column_name(
+        &self,
+        request: &TableSaveRequest,
+        change: &TableCellChange,
+    ) -> String {
+        if !change.column_name.is_empty() {
+            return change.column_name.clone();
+        }
+
+        request
+            .columns
+            .get(change.column_index)
+            .map(|column| column.name.clone())
+            .unwrap_or_default()
+    }
+
+    fn build_oracle_deleted_sql(
+        &self,
+        request: &TableSaveRequest,
+        change: &TableRowChange,
+    ) -> Option<String> {
+        let TableRowChange::Deleted {
+            original_data,
+            rowid,
+        } = change
+        else {
+            return None;
+        };
+
+        if let Some(rid) = rowid {
+            return Some(format!(
+                "DELETE FROM {} WHERE {} = {}",
+                self.oracle_table_ident(request),
+                self.rowid_column_name(),
+                oracle_string_literal(rid)
+            ));
+        }
+
+        let (where_clause, limit_clause) =
+            self.build_where_and_limit_clause(request, original_data);
+        Some(format!(
+            "DELETE FROM {}{}{}{}",
+            self.oracle_table_ident(request),
+            if where_clause.is_empty() {
+                ""
+            } else {
+                " WHERE "
+            },
+            where_clause,
+            limit_clause
+        ))
+    }
+}
+
+fn is_oracle_lob_column(column: Option<&ColumnInfo>) -> bool {
+    column
+        .map(|column| {
+            let data_type = column.data_type.to_ascii_uppercase();
+            data_type.contains("CLOB") || data_type.contains("NCLOB")
+        })
+        .unwrap_or(false)
+}
+
+#[derive(Clone, Copy)]
+enum OracleTemporalKind {
+    Date,
+    Timestamp,
+    TimestampTz,
+}
+
+fn oracle_temporal_value_expr(value: &str, column: Option<&ColumnInfo>) -> Option<String> {
+    let kind = oracle_temporal_kind(column)?;
+    let value = normalize_oracle_temporal_value(value);
+    let has_time = value.contains(':');
+    let has_fraction = value.contains('.');
+    let has_timezone = oracle_temporal_has_timezone(&value);
+
+    match kind {
+        OracleTemporalKind::Date if has_timezone => Some(format!(
+            "CAST({} AS DATE)",
+            oracle_timestamp_tz_expr(&value)
+        )),
+        OracleTemporalKind::Date if has_fraction => {
+            Some(format!("CAST({} AS DATE)", oracle_timestamp_expr(&value)))
+        }
+        OracleTemporalKind::Date if has_time => Some(oracle_date_expr(&value, true)),
+        OracleTemporalKind::Date => Some(oracle_date_expr(&value, false)),
+        OracleTemporalKind::Timestamp if has_timezone => Some(format!(
+            "CAST({} AS TIMESTAMP)",
+            oracle_timestamp_tz_expr(&value)
+        )),
+        OracleTemporalKind::Timestamp => Some(oracle_timestamp_expr(&value)),
+        OracleTemporalKind::TimestampTz if has_timezone => Some(oracle_timestamp_tz_expr(&value)),
+        OracleTemporalKind::TimestampTz => Some(oracle_timestamp_expr(&value)),
+    }
+}
+
+fn oracle_temporal_kind(column: Option<&ColumnInfo>) -> Option<OracleTemporalKind> {
+    let data_type = column?.data_type.to_ascii_uppercase();
+    if data_type.contains("TIMESTAMP WITH TIME ZONE")
+        || data_type.contains("TIMESTAMP WITH LOCAL TIME ZONE")
+    {
+        return Some(OracleTemporalKind::TimestampTz);
+    }
+    if data_type.contains("TIMESTAMP") {
+        return Some(OracleTemporalKind::Timestamp);
+    }
+    if data_type.trim() == "DATE" {
+        return Some(OracleTemporalKind::Date);
+    }
+    None
+}
+
+fn normalize_oracle_temporal_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if let Ok(datetime) = DateTime::parse_from_rfc3339(trimmed) {
+        return format_oracle_offset_datetime(datetime);
+    }
+
+    let normalized = trimmed.replace('T', " ");
+    match normalized.strip_suffix('Z') {
+        Some(prefix) => format!("{} +00:00", prefix.trim_end()),
+        None => normalized,
+    }
+}
+
+fn format_oracle_offset_datetime(value: DateTime<FixedOffset>) -> String {
+    let micros = value.timestamp_subsec_micros();
+    let datetime = if micros == 0 {
+        value.format("%Y-%m-%d %H:%M:%S").to_string()
+    } else {
+        format!("{}.{:06}", value.format("%Y-%m-%d %H:%M:%S"), micros)
+    };
+    format!("{} {}", datetime, value.format("%:z"))
+}
+
+fn oracle_temporal_has_timezone(value: &str) -> bool {
+    let value = value.trim();
+    if value.ends_with('Z') {
+        return true;
+    }
+    if value.len() < 6 {
+        return false;
+    }
+    let Some(suffix) = value.get(value.len().saturating_sub(6)..) else {
+        return false;
+    };
+    let mut chars = suffix.chars();
+    matches!(chars.next(), Some('+') | Some('-'))
+        && chars.nth(2) == Some(':')
+        && suffix[1..3].chars().all(|ch| ch.is_ascii_digit())
+        && suffix[4..6].chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn oracle_date_expr(value: &str, has_time: bool) -> String {
+    let format = if has_time {
+        ORACLE_DATETIME_FORMAT
+    } else {
+        ORACLE_DATE_FORMAT
+    };
+    format!(
+        "TO_DATE({}, {})",
+        oracle_string_literal(value),
+        oracle_string_literal(format)
+    )
+}
+
+fn oracle_timestamp_expr(value: &str) -> String {
+    let format = oracle_timestamp_format(value);
+    format!(
+        "TO_TIMESTAMP({}, {})",
+        oracle_string_literal(value),
+        oracle_string_literal(format)
+    )
+}
+
+fn oracle_timestamp_tz_expr(value: &str) -> String {
+    let format = if value.contains('.') {
+        ORACLE_DATETIME_TZ_FRACTION_FORMAT
+    } else {
+        ORACLE_DATETIME_TZ_FORMAT
+    };
+    format!(
+        "TO_TIMESTAMP_TZ({}, {})",
+        oracle_string_literal(value),
+        oracle_string_literal(format)
+    )
+}
+
+fn oracle_timestamp_format(value: &str) -> &'static str {
+    if value.contains('.') {
+        ORACLE_DATETIME_FRACTION_FORMAT
+    } else if value.contains(':') {
+        ORACLE_DATETIME_FORMAT
+    } else {
+        ORACLE_DATE_FORMAT
+    }
+}
+
+fn escaped_sql_literal_len(value: &str) -> usize {
+    value
+        .chars()
+        .map(|ch| if ch == '\'' { 2 } else { ch.len_utf8() })
+        .sum()
+}
+
+fn oracle_lob_literal_expr(value: &str, column: Option<&ColumnInfo>) -> String {
+    let chunks = split_oracle_literal_chunks(value, ORACLE_SQL_LITERAL_CHUNK_BYTES);
+    let constructor = if column
+        .map(|column| column.data_type.to_ascii_uppercase().contains("NCLOB"))
+        .unwrap_or(false)
+    {
+        "TO_NCLOB"
+    } else {
+        "TO_CLOB"
+    };
+
+    chunks
+        .into_iter()
+        .map(|chunk| format!("{}({})", constructor, oracle_string_literal(&chunk)))
+        .collect::<Vec<_>>()
+        .join(" || ")
+}
+
+fn oracle_chunked_string_literal_expr(value: &str) -> String {
+    split_oracle_literal_chunks(value, ORACLE_SQL_LITERAL_CHUNK_BYTES)
+        .into_iter()
+        .map(|chunk| oracle_string_literal(&chunk))
+        .collect::<Vec<_>>()
+        .join(" || ")
+}
+
+fn oracle_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn split_oracle_literal_chunks(value: &str, max_escaped_bytes: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0;
+
+    for ch in value.chars() {
+        let escaped_len = if ch == '\'' { 2 } else { ch.len_utf8() };
+        if current_len + escaped_len > max_escaped_bytes && !current.is_empty() {
+            chunks.push(current);
+            current = String::new();
+            current_len = 0;
+        }
+        current.push(ch);
+        current_len += escaped_len;
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
 }
 
 fn build_oracle_ui_manifest() -> DatabaseUiManifest {
+    let mut forms = vec![
+        oracle_connection_form(),
+        oracle_database_form(false),
+        oracle_database_form(true),
+    ];
+    forms.extend(oracle_user_forms());
+
     DatabaseUiManifest {
         capabilities: DatabaseUiCapabilities {
             uses_schema_as_database: true,
+            supports_users: true,
+            supports_user_create: true,
+            supports_user_edit: true,
+            supports_user_delete: true,
+            supports_user_privileges: true,
             supports_sequences: true,
             supports_functions: true,
             supports_procedures: true,
@@ -79,13 +539,86 @@ fn build_oracle_ui_manifest() -> DatabaseUiManifest {
             supports_tablespace: true,
             ..DatabaseUiCapabilities::default()
         },
-        forms: vec![
-            oracle_connection_form(),
-            oracle_database_form(false),
-            oracle_database_form(true),
-        ],
+        forms,
         actions: oracle_action_manifest(),
         ..DatabaseUiManifest::default()
+    }
+}
+
+fn oracle_quoted_password(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn oracle_user_password(request: &DatabaseUserOperationRequest) -> &str {
+    request
+        .field_values
+        .get("password")
+        .map(String::as_str)
+        .filter(|password| !password.is_empty())
+        .unwrap_or("change_me")
+}
+
+fn oracle_user_role(request: &DatabaseUserOperationRequest) -> &str {
+    match request.field_values.get("role").map(String::as_str) {
+        Some("CONNECT") => "CONNECT",
+        Some("RESOURCE") => "RESOURCE",
+        Some("DBA") => "DBA",
+        _ => "CONNECT",
+    }
+}
+
+fn oracle_user_forms() -> Vec<DatabaseFormManifest> {
+    vec![
+        oracle_user_form(DatabaseFormKind::CreateUser, true, false),
+        oracle_user_form(DatabaseFormKind::EditUser, true, false),
+        oracle_user_form(DatabaseFormKind::DeleteUser, false, false),
+        oracle_user_form(DatabaseFormKind::UserPrivileges, false, true),
+    ]
+}
+
+fn oracle_user_form(
+    kind: DatabaseFormKind,
+    include_password: bool,
+    include_role: bool,
+) -> DatabaseFormManifest {
+    let mut fields = vec![field(
+        "name",
+        "DatabaseUser.name",
+        DatabaseFormFieldType::Text,
+    )];
+    if include_password {
+        fields.push(field(
+            "password",
+            "DatabaseUser.password",
+            DatabaseFormFieldType::Password,
+        ));
+    }
+    if include_role {
+        fields.push(
+            field("role", "DatabaseUser.role", DatabaseFormFieldType::Select)
+                .with_default("CONNECT")
+                .with_options(vec![
+                    option("CONNECT", "DatabaseUser.role_connect"),
+                    option("RESOURCE", "DatabaseUser.role_resource"),
+                    option("DBA", "DatabaseUser.role_dba"),
+                ]),
+        );
+    }
+    DatabaseFormManifest {
+        kind,
+        title_i18n_key: user_form_title_key(kind).into(),
+        submit_i18n_key: "Common.save".into(),
+        tabs: vec![tab("user", "DatabaseUser.user_tab", fields)],
+    }
+}
+
+fn user_form_title_key(kind: DatabaseFormKind) -> &'static str {
+    match kind {
+        DatabaseFormKind::CreateUser => "DatabaseUser.create_title",
+        DatabaseFormKind::EditUser => "DatabaseUser.edit_title",
+        DatabaseFormKind::DeleteUser => "DatabaseUser.delete_title",
+        DatabaseFormKind::UserPrivileges => "DatabaseUser.privileges_title",
+        _ => "DatabaseUser.user_title",
     }
 }
 
@@ -133,10 +666,8 @@ fn oracle_connection_form() -> DatabaseFormManifest {
                         .with_placeholder("orcl (or use Service Name)"),
                 ],
             ),
-            tab(
-                "advanced",
-                "ConnectionForm.advanced",
-                vec![
+            {
+                let mut fields = vec![
                     field(
                         "connect_timeout",
                         "ConnectionForm.connect_timeout",
@@ -145,8 +676,10 @@ fn oracle_connection_form() -> DatabaseFormManifest {
                     .optional()
                     .with_placeholder("30")
                     .with_default("30"),
-                ],
-            ),
+                ];
+                fields.extend(schema_preference_fields());
+                tab("advanced", "ConnectionForm.advanced", fields)
+            },
             tab(
                 "ssh",
                 "ConnectionForm.ssh",
@@ -492,6 +1025,11 @@ impl DatabasePlugin for OraclePlugin {
             supports_functions: true,
             supports_procedures: true,
             supports_triggers: true,
+            supports_users: true,
+            supports_user_create: true,
+            supports_user_edit: true,
+            supports_user_delete: true,
+            supports_user_privileges: true,
             supports_tablespace: true,
             ..DatabaseUiCapabilities::default()
         }
@@ -521,6 +1059,22 @@ impl DatabasePlugin for OraclePlugin {
                 self.quote_identifier(table)
             ),
             None => self.quote_identifier(table),
+        }
+    }
+
+    fn generate_table_changes_sql(&self, request: &TableSaveRequest) -> String {
+        let mut sql_statements = Vec::new();
+
+        for change in &request.changes {
+            if let Some(sql) = self.build_oracle_table_change_sql(request, change) {
+                sql_statements.push(sql);
+            }
+        }
+
+        if sql_statements.is_empty() {
+            t!("Error.no_changes").to_string()
+        } else {
+            sql_statements.join(";\n\n") + ";"
         }
     }
 
@@ -598,14 +1152,12 @@ impl DatabasePlugin for OraclePlugin {
         let sql = r#"
         SELECT DISTINCT owner AS schema_name
         FROM all_objects
-        WHERE owner NOT IN ('SYS', 'SYSTEM')
-          AND owner NOT LIKE 'APEX%'
         ORDER BY owner
     "#;
 
         match connection.query(sql).await {
             Ok(SqlResult::Query(qr)) => {
-                let schemas: Vec<String> = qr
+                let schemas = qr
                     .rows
                     .iter()
                     .filter_map(|row| {
@@ -614,6 +1166,8 @@ impl DatabasePlugin for OraclePlugin {
                             .map(|s| s.trim().to_string())
                     })
                     .collect();
+                let schemas =
+                    filter_schemas(connection.config(), SchemaFilterProfile::Oracle, schemas);
 
                 if !schemas.is_empty() {
                     return Ok(schemas);
@@ -633,11 +1187,16 @@ impl DatabasePlugin for OraclePlugin {
             .map_err(|e| anyhow::anyhow!("Failed to list schemas (fallback): {}", e))?;
 
         if let SqlResult::Query(qr) = result {
-            Ok(qr
+            let schemas = qr
                 .rows
                 .iter()
                 .filter_map(|row| row.first().and_then(|v| v.clone()))
-                .collect())
+                .collect();
+            Ok(filter_schemas(
+                connection.config(),
+                SchemaFilterProfile::Oracle,
+                schemas,
+            ))
         } else {
             Err(anyhow::anyhow!("Unexpected result type"))
         }
@@ -765,8 +1324,6 @@ impl DatabasePlugin for OraclePlugin {
         connection: &dyn DbConnection,
         _database: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         // 先尝试高权限视图，再逐步降级到低权限可用视图，避免普通账号 ORA-00942。
         let schema_queries = [
             (
@@ -860,11 +1417,11 @@ impl DatabasePlugin for OraclePlugin {
         }
 
         let columns = vec![
-            Column::new("name", "Schema").width(px(180.0)),
-            Column::new("created", "Created").width(px(180.0)),
-            Column::new("tablespace", "Tablespace").width(px(150.0)),
-            Column::new("temp_tablespace", "Temp Tablespace").width(px(150.0)),
-            Column::new("status", "Status").width(px(100.0)),
+            Column::new("name", "Schema").width(180.0),
+            Column::new("created", "Created").width(180.0),
+            Column::new("tablespace", "Tablespace").width(150.0),
+            Column::new("temp_tablespace", "Temp Tablespace").width(150.0),
+            Column::new("status", "Status").width(100.0),
         ];
 
         Ok(ObjectView {
@@ -933,7 +1490,6 @@ impl DatabasePlugin for OraclePlugin {
         _database: &str,
         schema: Option<String>,
     ) -> Result<ObjectView> {
-        use gpui::px;
         if let Some(schema) = schema {
             let sql = format!(
                 r#"
@@ -979,10 +1535,10 @@ impl DatabasePlugin for OraclePlugin {
             };
 
             let columns = vec![
-                Column::new("name", "Name").width(px(200.0)),
-                Column::new("comment", "Comment").width(px(300.0)),
-                Column::new("rows", "Rows").width(px(100.0)),
-                Column::new("analyzed", "Last Analyzed").width(px(180.0)),
+                Column::new("name", "Name").width(200.0),
+                Column::new("comment", "Comment").width(300.0),
+                Column::new("rows", "Rows").width(100.0),
+                Column::new("analyzed", "Last Analyzed").width(180.0),
             ];
 
             return Ok(ObjectView {
@@ -1084,8 +1640,6 @@ impl DatabasePlugin for OraclePlugin {
         schema: Option<String>,
         table: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let columns_data = self
             .list_columns(connection, database, schema, table)
             .await?;
@@ -1105,12 +1659,12 @@ impl DatabasePlugin for OraclePlugin {
             .collect();
 
         let columns = vec![
-            Column::new("name", "Name").width(px(180.0)),
-            Column::new("type", "Type").width(px(150.0)),
-            Column::new("nullable", "Nullable").width(px(60.0)),
-            Column::new("pk", "PK").width(px(50.0)),
-            Column::new("default", "Default").width(px(120.0)),
-            Column::new("comment", "Comment").width(px(250.0)),
+            Column::new("name", "Name").width(180.0),
+            Column::new("type", "Type").width(150.0),
+            Column::new("nullable", "Nullable").width(60.0),
+            Column::new("pk", "PK").width(50.0),
+            Column::new("default", "Default").width(120.0),
+            Column::new("comment", "Comment").width(250.0),
         ];
 
         Ok(ObjectView {
@@ -1175,6 +1729,7 @@ impl DatabasePlugin for OraclePlugin {
                         name: index_name.clone(),
                         columns: vec![],
                         is_unique,
+                        is_primary: false,
                         index_type: Some(index_type),
                     })
                     .columns
@@ -1194,8 +1749,6 @@ impl DatabasePlugin for OraclePlugin {
         schema: Option<&str>,
         table: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let indexes = self
             .list_indexes(connection, database, schema.map(|s| s.to_string()), table)
             .await?;
@@ -1213,10 +1766,10 @@ impl DatabasePlugin for OraclePlugin {
             .collect();
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("columns", "Columns").width(px(250.0)),
-            Column::new("type", "Type").width(px(150.0)),
-            Column::new("unique", "Unique").width(px(80.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("columns", "Columns").width(250.0),
+            Column::new("type", "Type").width(150.0),
+            Column::new("unique", "Unique").width(80.0),
         ];
 
         Ok(ObjectView {
@@ -1273,8 +1826,6 @@ impl DatabasePlugin for OraclePlugin {
         connection: &dyn DbConnection,
         schema: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let sql = format!(
             r#"
             SELECT
@@ -1311,8 +1862,8 @@ impl DatabasePlugin for OraclePlugin {
         };
 
         let columns = vec![
-            Column::new("name", "Name").width(px(250.0)),
-            Column::new("comment", "Comment").width(px(400.0)),
+            Column::new("name", "Name").width(250.0),
+            Column::new("comment", "Comment").width(400.0),
         ];
 
         Ok(ObjectView {
@@ -1367,8 +1918,6 @@ impl DatabasePlugin for OraclePlugin {
         connection: &dyn DbConnection,
         schema: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let sql = format!(
             r#"
             SELECT
@@ -1412,10 +1961,10 @@ impl DatabasePlugin for OraclePlugin {
         };
 
         let columns = vec![
-            Column::new("name", "Name").width(px(250.0)),
-            Column::new("status", "Status").width(px(100.0)),
-            Column::new("created", "Created").width(px(180.0)),
-            Column::new("modified", "Modified").width(px(180.0)),
+            Column::new("name", "Name").width(250.0),
+            Column::new("status", "Status").width(100.0),
+            Column::new("created", "Created").width(180.0),
+            Column::new("modified", "Modified").width(180.0),
         ];
 
         Ok(ObjectView {
@@ -1469,8 +2018,6 @@ impl DatabasePlugin for OraclePlugin {
         connection: &dyn DbConnection,
         schema: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let sql = format!(
             r#"
             SELECT
@@ -1514,10 +2061,10 @@ impl DatabasePlugin for OraclePlugin {
         };
 
         let columns = vec![
-            Column::new("name", "Name").width(px(250.0)),
-            Column::new("status", "Status").width(px(100.0)),
-            Column::new("created", "Created").width(px(180.0)),
-            Column::new("modified", "Modified").width(px(180.0)),
+            Column::new("name", "Name").width(250.0),
+            Column::new("status", "Status").width(100.0),
+            Column::new("created", "Created").width(180.0),
+            Column::new("modified", "Modified").width(180.0),
         ];
 
         Ok(ObjectView {
@@ -1574,8 +2121,6 @@ impl DatabasePlugin for OraclePlugin {
         connection: &dyn DbConnection,
         schema: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let sql = format!(
             r#"
             SELECT
@@ -1623,11 +2168,11 @@ impl DatabasePlugin for OraclePlugin {
         };
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("table", "Table").width(px(150.0)),
-            Column::new("event", "Event").width(px(150.0)),
-            Column::new("type", "Type").width(px(150.0)),
-            Column::new("status", "Status").width(px(100.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("table", "Table").width(150.0),
+            Column::new("event", "Event").width(150.0),
+            Column::new("type", "Type").width(150.0),
+            Column::new("status", "Status").width(100.0),
         ];
 
         Ok(ObjectView {
@@ -1699,8 +2244,6 @@ impl DatabasePlugin for OraclePlugin {
         connection: &dyn DbConnection,
         schema: &str,
     ) -> Result<ObjectView> {
-        use gpui::px;
-
         let sql = format!(
             r#"
             SELECT
@@ -1756,13 +2299,13 @@ impl DatabasePlugin for OraclePlugin {
         };
 
         let columns = vec![
-            Column::new("name", "Name").width(px(200.0)),
-            Column::new("min", "Min").width(px(100.0)),
-            Column::new("max", "Max").width(px(100.0)),
-            Column::new("increment", "Increment").width(px(100.0)),
-            Column::new("last", "Last Value").width(px(100.0)),
-            Column::new("cache", "Cache").width(px(80.0)),
-            Column::new("cycle", "Cycle").width(px(60.0)),
+            Column::new("name", "Name").width(200.0),
+            Column::new("min", "Min").width(100.0),
+            Column::new("max", "Max").width(100.0),
+            Column::new("increment", "Increment").width(100.0),
+            Column::new("last", "Last Value").width(100.0),
+            Column::new("cache", "Cache").width(80.0),
+            Column::new("cycle", "Cycle").width(60.0),
         ];
 
         Ok(ObjectView {
@@ -1796,6 +2339,61 @@ impl DatabasePlugin for OraclePlugin {
         }
 
         def
+    }
+
+    fn build_list_users_sql(&self, _database: Option<&str>) -> Option<String> {
+        Some(
+            r#"SELECT
+  username,
+  user_id,
+  created
+FROM all_users
+ORDER BY username;"#
+                .to_string(),
+        )
+    }
+
+    fn user_list_columns(&self) -> Vec<Column> {
+        vec![
+            Column::localized("username", "DatabaseUser.columns.username").width(180.0),
+            Column::localized("user_id", "DatabaseUser.columns.user_id")
+                .width(100.0)
+                .text_right(),
+            Column::localized("created", "DatabaseUser.columns.created_at").width(180.0),
+        ]
+    }
+
+    fn build_create_user_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        let user = self.quote_identifier(&request.user_name);
+        Some(format!(
+            "CREATE USER {} IDENTIFIED BY {};\nGRANT CONNECT TO {};",
+            user,
+            oracle_quoted_password(oracle_user_password(request)),
+            user
+        ))
+    }
+
+    fn build_modify_user_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        Some(format!(
+            "ALTER USER {} IDENTIFIED BY {};",
+            self.quote_identifier(&request.user_name),
+            oracle_quoted_password(oracle_user_password(request))
+        ))
+    }
+
+    fn build_drop_user_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        Some(format!(
+            "DROP USER {} CASCADE;",
+            self.quote_identifier(&request.user_name)
+        ))
+    }
+
+    fn build_user_privileges_sql(&self, request: &DatabaseUserOperationRequest) -> Option<String> {
+        Some(format!(
+            "GRANT {} TO {};",
+            oracle_user_role(request),
+            self.quote_identifier(&request.user_name)
+        ))
     }
 
     fn build_create_database_sql(
@@ -1921,6 +2519,44 @@ impl DatabasePlugin for OraclePlugin {
         def
     }
 
+    fn build_foreign_key_def(&self, foreign_key: &ForeignKeyDefinition) -> String {
+        let columns = foreign_key
+            .columns
+            .iter()
+            .map(|column| self.quote_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ref_columns = foreign_key
+            .ref_columns
+            .iter()
+            .map(|column| self.quote_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut definition = format!(
+            "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
+            self.quote_identifier(&foreign_key.name),
+            columns,
+            self.quote_identifier(&foreign_key.ref_table),
+            ref_columns
+        );
+        if let Some(action) = Self::foreign_key_delete_action_sql(&foreign_key.on_delete) {
+            definition.push_str(&format!(" ON DELETE {action}"));
+        }
+        definition
+    }
+
+    fn foreign_key_changed(
+        &self,
+        left: &ForeignKeyDefinition,
+        right: &ForeignKeyDefinition,
+    ) -> bool {
+        left.columns != right.columns
+            || left.ref_table != right.ref_table
+            || left.ref_columns != right.ref_columns
+            || Self::foreign_key_delete_action_sql(&left.on_delete)
+                != Self::foreign_key_delete_action_sql(&right.on_delete)
+    }
+
     fn build_create_table_sql(&self, design: &TableDesign) -> String {
         let mut sql = String::new();
         sql.push_str("CREATE TABLE ");
@@ -1947,8 +2583,17 @@ impl DatabasePlugin for OraclePlugin {
             definitions.push(format!("  PRIMARY KEY ({})", pk_cols.join(", ")));
         }
 
+        for foreign_key in &design.foreign_keys {
+            definitions.push(format!("  {}", self.build_foreign_key_def(foreign_key)));
+        }
+
         sql.push_str(&definitions.join(",\n"));
         sql.push_str("\n);");
+
+        for comment_sql in self.design_comment_sql(design) {
+            sql.push('\n');
+            sql.push_str(&comment_sql);
+        }
 
         for idx in &design.indexes {
             if idx.is_primary {
@@ -1996,6 +2641,24 @@ impl DatabasePlugin for OraclePlugin {
             .collect();
         let new_cols: std::collections::HashMap<&str, &ColumnDefinition> =
             new.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+        let original_foreign_keys: HashMap<&str, &ForeignKeyDefinition> = original
+            .foreign_keys
+            .iter()
+            .map(|foreign_key| (foreign_key.name.as_str(), foreign_key))
+            .collect();
+        let new_foreign_keys: HashMap<&str, &ForeignKeyDefinition> = new
+            .foreign_keys
+            .iter()
+            .map(|foreign_key| (foreign_key.name.as_str(), foreign_key))
+            .collect();
+
+        for (name, original_foreign_key) in &original_foreign_keys {
+            match new_foreign_keys.get(name) {
+                Some(new_foreign_key)
+                    if !self.foreign_key_changed(original_foreign_key, new_foreign_key) => {}
+                _ => statements.push(self.build_drop_foreign_key_sql(&new.table_name, name)),
+            }
+        }
 
         for name in original_cols.keys() {
             if !new_cols.contains_key(name) {
@@ -2033,9 +2696,23 @@ impl DatabasePlugin for OraclePlugin {
                         modify_parts.join(" ")
                     ));
                 }
+                if orig_col.comment != col.comment {
+                    statements.push(self.column_comment_sql(
+                        &new.table_name,
+                        &col.name,
+                        &col.comment,
+                    ));
+                }
             } else {
                 let col_def = self.build_column_def(col);
                 statements.push(format!("ALTER TABLE {} ADD {};", table_name, col_def));
+                if !col.comment.is_empty() {
+                    statements.push(self.column_comment_sql(
+                        &new.table_name,
+                        &col.name,
+                        &col.comment,
+                    ));
+                }
             }
         }
 
@@ -2084,6 +2761,19 @@ impl DatabasePlugin for OraclePlugin {
             }
         }
 
+        for (name, new_foreign_key) in &new_foreign_keys {
+            match original_foreign_keys.get(name) {
+                Some(original_foreign_key)
+                    if !self.foreign_key_changed(original_foreign_key, new_foreign_key) => {}
+                _ => statements
+                    .push(self.build_add_foreign_key_sql(&new.table_name, new_foreign_key)),
+            }
+        }
+
+        if original.options.comment != new.options.comment {
+            statements.push(self.table_comment_sql(&new.table_name, &new.options.comment));
+        }
+
         if statements.is_empty() {
             "-- No changes detected".to_string()
         } else {
@@ -2126,11 +2816,42 @@ mod tests {
     use super::*;
     use crate::plugin::DatabasePlugin;
     use crate::plugin_manifest::{DatabaseActionId, DatabaseFormKind};
-    use crate::types::{ColumnDefinition, IndexDefinition, TableDesign, TableOptions};
+    use crate::types::{
+        ColumnDefinition, ColumnInfo, ForeignKeyDefinition, IndexDefinition, TableCellChange,
+        TableDesign, TableOptions, TableRowChange, TableSaveRequest,
+    };
     use std::collections::HashMap;
 
     fn create_plugin() -> OraclePlugin {
         OraclePlugin::new()
+    }
+
+    fn user_request(
+        user_name: &str,
+        values: &[(&str, &str)],
+    ) -> crate::plugin::DatabaseUserOperationRequest {
+        crate::plugin::DatabaseUserOperationRequest {
+            user_name: user_name.to_string(),
+            host: None,
+            database: None,
+            field_values: values
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+        }
+    }
+
+    fn column_info(name: &str, data_type: &str, is_primary_key: bool) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            is_nullable: !is_primary_key,
+            is_primary_key,
+            default_value: None,
+            comment: None,
+            charset: None,
+            collation: None,
+        }
     }
 
     // ==================== Basic Plugin Info Tests ====================
@@ -2162,6 +2883,17 @@ mod tests {
     }
 
     #[test]
+    fn test_capabilities_support_users() {
+        let capabilities = create_plugin().capabilities();
+
+        assert!(capabilities.supports_users);
+        assert!(capabilities.supports_user_create);
+        assert!(capabilities.supports_user_edit);
+        assert!(capabilities.supports_user_delete);
+        assert!(capabilities.supports_user_privileges);
+    }
+
+    #[test]
     fn test_ui_manifest_smoke() {
         let manifest = create_plugin().ui_manifest();
         let form_kinds: Vec<_> = manifest.forms.iter().map(|form| form.kind).collect();
@@ -2173,6 +2905,10 @@ mod tests {
                 DatabaseFormKind::Connection,
                 DatabaseFormKind::CreateDatabase,
                 DatabaseFormKind::EditDatabase,
+                DatabaseFormKind::CreateUser,
+                DatabaseFormKind::EditUser,
+                DatabaseFormKind::DeleteUser,
+                DatabaseFormKind::UserPrivileges,
             ]
         );
         assert!(
@@ -2223,12 +2959,238 @@ mod tests {
         );
     }
 
+    // ==================== Table Data Change SQL Tests ====================
+
+    #[test]
+    fn table_change_sql_chunks_long_clob_literals() {
+        let plugin = create_plugin();
+        let long_value = "a".repeat(ORACLE_SQL_LITERAL_CHUNK_BYTES + 50);
+        let request = TableSaveRequest {
+            database: String::new(),
+            schema: Some("APP".to_string()),
+            table: "DOCS".to_string(),
+            columns: vec![
+                column_info("ID", "NUMBER", true),
+                column_info("BODY", "CLOB", false),
+            ],
+            index_infos: vec![],
+            changes: vec![TableRowChange::Updated {
+                original_data: vec!["1".to_string(), "old".to_string()],
+                changes: vec![TableCellChange {
+                    column_index: 1,
+                    column_name: "BODY".to_string(),
+                    old_value: "old".to_string(),
+                    new_value: long_value,
+                }],
+                rowid: Some("AAABBB".to_string()),
+            }],
+        };
+
+        let sql = plugin.generate_table_changes_sql(&request);
+
+        assert!(sql.contains("TO_CLOB('"));
+        assert!(sql.contains(" || TO_CLOB('"));
+        assert!(sql.contains("WHERE ROWID = 'AAABBB'"));
+    }
+
+    #[test]
+    fn table_change_sql_keeps_short_varchar_literal() {
+        let plugin = create_plugin();
+        let request = TableSaveRequest {
+            database: String::new(),
+            schema: Some("APP".to_string()),
+            table: "USERS".to_string(),
+            columns: vec![
+                column_info("ID", "NUMBER", true),
+                column_info("NAME", "VARCHAR2", false),
+            ],
+            index_infos: vec![],
+            changes: vec![TableRowChange::Updated {
+                original_data: vec!["1".to_string(), "Bob".to_string()],
+                changes: vec![TableCellChange {
+                    column_index: 1,
+                    column_name: "NAME".to_string(),
+                    old_value: "Bob".to_string(),
+                    new_value: "Alice's".to_string(),
+                }],
+                rowid: Some("AAABBB".to_string()),
+            }],
+        };
+
+        let sql = plugin.generate_table_changes_sql(&request);
+
+        assert_eq!(
+            "UPDATE \"APP\".\"USERS\" SET \"NAME\" = 'Alice''s' WHERE ROWID = 'AAABBB';",
+            sql
+        );
+    }
+
+    #[test]
+    fn table_change_sql_chunks_long_varchar_without_lob_constructor() {
+        let plugin = create_plugin();
+        let long_value = "b".repeat(ORACLE_SQL_LITERAL_CHUNK_BYTES + 20);
+        let request = TableSaveRequest {
+            database: String::new(),
+            schema: Some("APP".to_string()),
+            table: "USERS".to_string(),
+            columns: vec![
+                column_info("ID", "NUMBER", true),
+                column_info("NOTE", "VARCHAR2", false),
+            ],
+            index_infos: vec![],
+            changes: vec![TableRowChange::Updated {
+                original_data: vec!["1".to_string(), "old".to_string()],
+                changes: vec![TableCellChange {
+                    column_index: 1,
+                    column_name: "NOTE".to_string(),
+                    old_value: "old".to_string(),
+                    new_value: long_value,
+                }],
+                rowid: Some("AAABBB".to_string()),
+            }],
+        };
+
+        let sql = plugin.generate_table_changes_sql(&request);
+
+        assert!(sql.contains("\"NOTE\" = '"));
+        assert!(sql.contains("' || '"));
+        assert!(!sql.contains("TO_CLOB("));
+        assert!(!sql.contains("TO_NCLOB("));
+    }
+
+    #[test]
+    fn table_change_sql_formats_oracle_date_literals() {
+        let plugin = create_plugin();
+        let request = TableSaveRequest {
+            database: String::new(),
+            schema: Some("APP".to_string()),
+            table: "EVENTS".to_string(),
+            columns: vec![
+                column_info("ID", "NUMBER", true),
+                column_info("STARTED_AT", "DATE", false),
+            ],
+            index_infos: vec![],
+            changes: vec![TableRowChange::Added {
+                data: vec!["1".to_string(), "2026-06-21 14:05:06".to_string()],
+            }],
+        };
+
+        let sql = plugin.generate_table_changes_sql(&request);
+
+        assert_eq!(
+            "INSERT INTO \"APP\".\"EVENTS\" (\"ID\", \"STARTED_AT\") VALUES ('1', TO_DATE('2026-06-21 14:05:06', 'YYYY-MM-DD HH24:MI:SS'));",
+            sql
+        );
+    }
+
+    #[test]
+    fn table_change_sql_formats_oracle_timestamp_literals() {
+        let plugin = create_plugin();
+        let request = TableSaveRequest {
+            database: String::new(),
+            schema: Some("APP".to_string()),
+            table: "EVENTS".to_string(),
+            columns: vec![
+                column_info("ID", "NUMBER", true),
+                column_info("CREATED_AT", "TIMESTAMP(6)", false),
+            ],
+            index_infos: vec![],
+            changes: vec![TableRowChange::Updated {
+                original_data: vec!["1".to_string(), "2026-06-21 14:05:06".to_string()],
+                changes: vec![TableCellChange {
+                    column_index: 1,
+                    column_name: "CREATED_AT".to_string(),
+                    old_value: "2026-06-21 14:05:06".to_string(),
+                    new_value: "2026-06-21 14:05:06.123456".to_string(),
+                }],
+                rowid: Some("AAABBB".to_string()),
+            }],
+        };
+
+        let sql = plugin.generate_table_changes_sql(&request);
+
+        assert_eq!(
+            "UPDATE \"APP\".\"EVENTS\" SET \"CREATED_AT\" = TO_TIMESTAMP('2026-06-21 14:05:06.123456', 'YYYY-MM-DD HH24:MI:SS.FF6') WHERE ROWID = 'AAABBB';",
+            sql
+        );
+    }
+
+    #[test]
+    fn table_change_sql_formats_oracle_timestamp_tz_literals() {
+        let plugin = create_plugin();
+        let request = TableSaveRequest {
+            database: String::new(),
+            schema: Some("APP".to_string()),
+            table: "EVENTS".to_string(),
+            columns: vec![
+                column_info("ID", "NUMBER", true),
+                column_info("UPDATED_AT", "TIMESTAMP WITH TIME ZONE", false),
+            ],
+            index_infos: vec![],
+            changes: vec![TableRowChange::Added {
+                data: vec!["1".to_string(), "2026-06-21 14:05:06 +08:00".to_string()],
+            }],
+        };
+
+        let sql = plugin.generate_table_changes_sql(&request);
+
+        assert_eq!(
+            "INSERT INTO \"APP\".\"EVENTS\" (\"ID\", \"UPDATED_AT\") VALUES ('1', TO_TIMESTAMP_TZ('2026-06-21 14:05:06 +08:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM'));",
+            sql
+        );
+    }
+
+    #[test]
+    fn oracle_lob_literal_chunks_escape_quotes_once() {
+        let expr = oracle_lob_literal_expr("a'b", None);
+
+        assert_eq!("TO_CLOB('a''b')", expr);
+    }
+
     #[test]
     fn test_drop_view() {
         let plugin = create_plugin();
         let sql = plugin.drop_view("test_schema", "my_view");
         assert!(sql.contains("DROP VIEW"));
         assert!(sql.contains("\"my_view\""));
+    }
+
+    #[test]
+    fn test_build_list_users_sql() {
+        let plugin = create_plugin();
+        let sql = plugin
+            .build_list_users_sql(Some("appdb"))
+            .expect("Oracle supports user listing");
+
+        assert!(sql.contains("FROM all_users"));
+        assert!(sql.contains("username"));
+        assert!(sql.contains("user_id"));
+    }
+
+    #[test]
+    fn test_build_oracle_user_operation_sql() {
+        let plugin = create_plugin();
+        let request = user_request("APP\"USER", &[("password", "pa\"ss"), ("role", "CONNECT")]);
+
+        assert_eq!(
+            Some(
+                "CREATE USER \"APP\"\"USER\" IDENTIFIED BY \"pa\"\"ss\";\nGRANT CONNECT TO \"APP\"\"USER\";"
+                    .to_string()
+            ),
+            plugin.build_create_user_sql(&request)
+        );
+        assert_eq!(
+            Some("ALTER USER \"APP\"\"USER\" IDENTIFIED BY \"pa\"\"ss\";".to_string()),
+            plugin.build_modify_user_sql(&request)
+        );
+        assert_eq!(
+            Some("DROP USER \"APP\"\"USER\" CASCADE;".to_string()),
+            plugin.build_drop_user_sql(&request)
+        );
+        assert_eq!(
+            Some("GRANT CONNECT TO \"APP\"\"USER\";".to_string()),
+            plugin.build_user_privileges_sql(&request)
+        );
     }
 
     // ==================== Database/Schema Operations Tests ====================
@@ -2379,6 +3341,31 @@ mod tests {
     }
 
     #[test]
+    fn test_build_create_table_sql_with_comments() {
+        let plugin = create_plugin();
+        let design = TableDesign {
+            database_name: "test_schema".to_string(),
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("name")
+                    .data_type("VARCHAR2")
+                    .length(100)
+                    .comment("Display name"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![],
+            options: TableOptions {
+                comment: "User table".to_string(),
+                ..TableOptions::default()
+            },
+        };
+
+        let sql = plugin.build_create_table_sql(&design);
+        assert!(sql.contains("COMMENT ON TABLE \"users\" IS 'User table';"));
+        assert!(sql.contains("COMMENT ON COLUMN \"users\".\"name\" IS 'Display name';"));
+    }
+
+    #[test]
     fn test_build_create_table_sql_with_indexes() {
         let plugin = create_plugin();
         let design = TableDesign {
@@ -2411,6 +3398,67 @@ mod tests {
         let sql = plugin.build_create_table_sql(&design);
         assert!(sql.contains("INDEX \"idx_user_id\""));
         assert!(sql.contains("UNIQUE INDEX \"idx_email\""));
+    }
+
+    #[test]
+    fn test_build_create_table_sql_with_foreign_keys() {
+        let plugin = create_plugin();
+        let design = TableDesign {
+            database_name: "test_schema".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id")
+                    .data_type("NUMBER")
+                    .nullable(false),
+                ColumnDefinition::new("order_id")
+                    .data_type("NUMBER")
+                    .nullable(false),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_order".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "CASCADE".to_string(),
+                on_update: String::new(),
+            }],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_create_table_sql(&design);
+
+        assert!(sql.contains(
+            "CONSTRAINT \"fk_order_items_order\" FOREIGN KEY (\"order_id\") REFERENCES \"orders\" (\"id\") ON DELETE CASCADE"
+        ));
+    }
+
+    #[test]
+    fn test_build_create_table_sql_omits_unsupported_foreign_key_on_update() {
+        let plugin = create_plugin();
+        let design = TableDesign {
+            database_name: "test_schema".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("NUMBER"),
+                ColumnDefinition::new("order_id").data_type("NUMBER"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_order".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "SET NULL".to_string(),
+                on_update: "CASCADE".to_string(),
+            }],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_create_table_sql(&design);
+
+        assert!(sql.contains("ON DELETE SET NULL"));
+        assert!(!sql.contains("ON UPDATE"));
     }
 
     #[test]
@@ -2548,6 +3596,41 @@ mod tests {
     }
 
     #[test]
+    fn test_build_alter_table_sql_updates_comments_only() {
+        let plugin = create_plugin();
+
+        let original = TableDesign {
+            database_name: "test_schema".to_string(),
+            table_name: "users".to_string(),
+            columns: vec![
+                ColumnDefinition::new("name")
+                    .data_type("VARCHAR2")
+                    .length(50),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![],
+            options: TableOptions::default(),
+        };
+        let new = TableDesign {
+            columns: vec![
+                ColumnDefinition::new("name")
+                    .data_type("VARCHAR2")
+                    .length(50)
+                    .comment("Display name"),
+            ],
+            options: TableOptions {
+                comment: "User table".to_string(),
+                ..TableOptions::default()
+            },
+            ..original.clone()
+        };
+
+        let sql = plugin.build_alter_table_sql(&original, &new);
+        assert!(sql.contains("COMMENT ON TABLE \"users\" IS 'User table';"));
+        assert!(sql.contains("COMMENT ON COLUMN \"users\".\"name\" IS 'Display name';"));
+    }
+
+    #[test]
     fn test_build_alter_table_sql_add_unique_index() {
         let plugin = create_plugin();
 
@@ -2587,6 +3670,63 @@ mod tests {
         assert!(sql.contains("CREATE UNIQUE INDEX"));
         assert!(sql.contains("\"idx_email\""));
         assert!(sql.contains("\"email\""));
+    }
+
+    #[test]
+    fn test_build_alter_table_sql_add_and_drop_foreign_keys() {
+        let plugin = create_plugin();
+
+        let original = TableDesign {
+            database_name: "test_schema".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("NUMBER"),
+                ColumnDefinition::new("order_id").data_type("NUMBER"),
+                ColumnDefinition::new("legacy_order_id").data_type("NUMBER"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_legacy".to_string(),
+                columns: vec!["legacy_order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: String::new(),
+                on_update: String::new(),
+            }],
+            options: TableOptions::default(),
+        };
+        let new = TableDesign {
+            database_name: "test_schema".to_string(),
+            table_name: "order_items".to_string(),
+            columns: vec![
+                ColumnDefinition::new("id").data_type("NUMBER"),
+                ColumnDefinition::new("order_id").data_type("NUMBER"),
+            ],
+            indexes: vec![],
+            foreign_keys: vec![ForeignKeyDefinition {
+                name: "fk_order_items_order".to_string(),
+                columns: vec!["order_id".to_string()],
+                ref_table: "orders".to_string(),
+                ref_columns: vec!["id".to_string()],
+                on_delete: "CASCADE".to_string(),
+                on_update: String::new(),
+            }],
+            options: TableOptions::default(),
+        };
+
+        let sql = plugin.build_alter_table_sql(&original, &new);
+
+        assert!(
+            sql.contains("ALTER TABLE \"order_items\" DROP CONSTRAINT \"fk_order_items_legacy\";")
+        );
+        assert!(
+            sql.find("DROP CONSTRAINT \"fk_order_items_legacy\"")
+                .unwrap()
+                < sql.find("DROP COLUMN \"legacy_order_id\"").unwrap()
+        );
+        assert!(sql.contains(
+            "ALTER TABLE \"order_items\" ADD CONSTRAINT \"fk_order_items_order\" FOREIGN KEY (\"order_id\") REFERENCES \"orders\" (\"id\") ON DELETE CASCADE;"
+        ));
     }
 
     // ==================== Completion Info Tests ====================

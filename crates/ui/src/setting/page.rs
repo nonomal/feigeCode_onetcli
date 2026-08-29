@@ -1,12 +1,12 @@
 use gpui::{
-    App, Entity, InteractiveElement as _, IntoElement, ListAlignment, ListState,
+    App, Entity, InteractiveElement as _, IntoElement, ListAlignment, ListOffset, ListState,
     ParentElement as _, SharedString, StyleRefinement, Styled, Window, div, list,
     prelude::FluentBuilder as _, px,
 };
 use rust_i18n::t;
 
 use crate::{
-    ActiveTheme, IconName, Sizable, StyledExt,
+    ActiveTheme, Icon, IconName, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     h_flex,
     label::Label,
@@ -15,9 +15,17 @@ use crate::{
     v_flex,
 };
 
+fn settings_group_list_offset(group_ix: usize) -> ListOffset {
+    ListOffset {
+        item_ix: group_ix,
+        offset_in_item: px(0.),
+    }
+}
+
 /// A setting page that can contain multiple setting groups.
 #[derive(Clone)]
 pub struct SettingPage {
+    pub(super) icon: Option<Icon>,
     resettable: bool,
     pub(super) default_open: bool,
     pub(super) title: SharedString,
@@ -29,6 +37,7 @@ pub struct SettingPage {
 impl SettingPage {
     pub fn new(title: impl Into<SharedString>) -> Self {
         Self {
+            icon: None,
             resettable: true,
             default_open: false,
             title: title.into(),
@@ -41,6 +50,12 @@ impl SettingPage {
     /// Set the title of the setting page.
     pub fn title(mut self, title: impl Into<SharedString>) -> Self {
         self.title = title.into();
+        self
+    }
+
+    /// Set the icon of the setting page.
+    pub fn icon(mut self, icon: impl Into<Icon>) -> Self {
+        self.icon = Some(icon.into());
         self
     }
 
@@ -128,7 +143,7 @@ impl SettingPage {
             state.update(cx, |state, _| {
                 state.deferred_scroll_group_ix = None;
             });
-            list_state.scroll_to_reveal_item(ix);
+            list_state.scroll_to(settings_group_list_offset(ix));
         }
 
         v_flex()
@@ -198,5 +213,19 @@ impl SettingPage {
                     )
                     .vertical_scrollbar(&list_state),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::settings_group_list_offset;
+    use gpui::px;
+
+    #[test]
+    fn settings_group_list_offset_aligns_group_to_top() {
+        let offset = settings_group_list_offset(7);
+
+        assert_eq!(7, offset.item_ix);
+        assert_eq!(px(0.), offset.offset_in_item);
     }
 }

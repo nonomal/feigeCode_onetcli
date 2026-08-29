@@ -19,6 +19,7 @@ use gpui_component::{
 };
 use one_core::storage::DatabaseType;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 pub struct GenericDatabaseForm {
     database_type: DatabaseType,
@@ -28,6 +29,7 @@ pub struct GenericDatabaseForm {
     field_inputs: HashMap<String, Entity<InputState>>,
     field_selects: HashMap<String, Entity<SelectState<Vec<FormSelectItem>>>>,
     is_edit_mode: bool,
+    text_resolver: Rc<dyn Fn(&str) -> String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -35,6 +37,16 @@ impl GenericDatabaseForm {
     pub fn new(
         database_type: DatabaseType,
         manifest: DatabaseFormManifest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_text_resolver(database_type, manifest, Rc::new(translate), window, cx)
+    }
+
+    pub fn new_with_text_resolver(
+        database_type: DatabaseType,
+        manifest: DatabaseFormManifest,
+        text_resolver: Rc<dyn Fn(&str) -> String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -72,7 +84,7 @@ impl GenericDatabaseForm {
 
             if matches!(field.field_type, DatabaseFormFieldType::Select) {
                 let options = resolve_field_options(plugin.as_ref(), field, &initial_values);
-                let items = to_select_items(options.clone());
+                let items = to_select_items(options.clone(), text_resolver.as_ref());
                 let selected_index = items
                     .iter()
                     .position(|item| item.value == current_value)
@@ -98,7 +110,9 @@ impl GenericDatabaseForm {
                 subscriptions.push(subscription);
                 field_selects.insert(field.id.clone(), select);
             } else {
-                let input = cx.new(|cx| build_input_state(field, &current_value, window, cx));
+                let input = cx.new(|cx| {
+                    build_input_state(field, &current_value, text_resolver.as_ref(), window, cx)
+                });
                 let field_id = field.id.clone();
                 let subscription =
                     cx.subscribe_in(&input, window, move |this, input, event, window, cx| {
@@ -126,6 +140,7 @@ impl GenericDatabaseForm {
             field_inputs,
             field_selects,
             is_edit_mode,
+            text_resolver,
             _subscriptions: subscriptions,
         }
     }
@@ -167,7 +182,7 @@ impl GenericDatabaseForm {
 
             let options = resolve_field_options(plugin.as_ref(), &field, &state);
             let next_value = default_select_value(&field, &options);
-            let items = to_select_items(options);
+            let items = to_select_items(options, self.text_resolver.as_ref());
             let selected_index = items
                 .iter()
                 .position(|item| item.value == next_value)
@@ -236,6 +251,7 @@ impl Render for GenericDatabaseForm {
                         Some(render_database_field(
                             field,
                             self.is_edit_mode,
+                            self.text_resolver.as_ref(),
                             &self.field_inputs,
                             &self.field_selects,
                         ))
@@ -244,7 +260,7 @@ impl Render for GenericDatabaseForm {
     }
 }
 
-fn flatten_fields(manifest: &DatabaseFormManifest) -> Vec<DatabaseFormField> {
+pub(crate) fn flatten_fields(manifest: &DatabaseFormManifest) -> Vec<DatabaseFormField> {
     manifest
         .tabs
         .iter()
@@ -252,16 +268,17 @@ fn flatten_fields(manifest: &DatabaseFormManifest) -> Vec<DatabaseFormField> {
         .collect()
 }
 
-fn build_input_state(
+pub(crate) fn build_input_state(
     field: &DatabaseFormField,
     value: &str,
+    text_resolver: &dyn Fn(&str) -> String,
     window: &mut Window,
     cx: &mut Context<InputState>,
 ) -> InputState {
     let placeholder = field
         .placeholder_i18n_key
         .as_deref()
-        .map(translate)
+        .map(text_resolver)
         .unwrap_or_default();
     let mut input = InputState::new(window, cx).placeholder(placeholder);
     if matches!(field.field_type, DatabaseFormFieldType::Password) {
@@ -276,9 +293,10 @@ fn build_input_state(
     input
 }
 
-fn render_database_field(
+pub(crate) fn render_database_field(
     field_info: &DatabaseFormField,
     is_edit_mode: bool,
+    text_resolver: &dyn Fn(&str) -> String,
     field_inputs: &HashMap<String, Entity<InputState>>,
     field_selects: &HashMap<String, Entity<SelectState<Vec<FormSelectItem>>>>,
 ) -> gpui_component::form::Field {
@@ -288,7 +306,7 @@ fn render_database_field(
     let disabled = is_edit_mode && field_info.disabled_when_editing;
 
     field()
-        .label(translate(&field_info.label_i18n_key))
+        .label(text_resolver(&field_info.label_i18n_key))
         .required(field_info.required)
         .when(!is_textarea, |f| f.items_center())
         .when(is_textarea, |f| f.items_start())

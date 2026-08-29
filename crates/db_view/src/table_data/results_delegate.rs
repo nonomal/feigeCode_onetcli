@@ -4,9 +4,9 @@ use super::copy_format::{CopyFormat, CopyFormatter, TableMetadata};
 use super::data_grid::DataGrid;
 use db::{ColumnInfo, FieldType};
 use gpui::{
-    App, AppContext, ClipboardItem, Context, InteractiveElement, IntoElement, ParentElement as _,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div,
-    prelude::FluentBuilder, px,
+    App, AppContext, ClipboardItem, Context, Font, InteractiveElement, IntoElement,
+    ParentElement as _, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    WeakEntity, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::calendar::Date;
 use gpui_component::date_picker::{DatePickerEvent, DatePickerState};
@@ -16,6 +16,7 @@ use gpui_component::menu::{PopupMenu, PopupMenuItem};
 use gpui_component::time_picker::{TimePickerEvent, TimePickerState};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, WindowExt, h_flex};
+use one_core::settings::{AppSettings, installed_grid_monospace_font};
 use one_core::storage::DatabaseType;
 use one_ui::edit_table::{
     CellEditor, Column, ColumnSort, EditTableDelegate, EditTableEvent, EditTableState,
@@ -104,6 +105,8 @@ pub struct EditorTableDelegate {
     filtered_row_indices: Option<Vec<usize>>,
     /// Column filter conditions: col_ix -> selected values
     column_filters: HashMap<usize, HashSet<String>>,
+    /// Local table data search query. Empty means no row search.
+    row_search_query: String,
     /// Whether cells are editable
     editable: bool,
     /// Whether the table is currently loading data
@@ -116,6 +119,13 @@ pub struct EditorTableDelegate {
     primary_key_indices: Vec<usize>,
     /// Data grid handle for context menu actions
     data_grid: Option<WeakEntity<DataGrid>>,
+    preview_font_cache: Option<PreviewFontCache>,
+}
+
+#[derive(Clone)]
+struct PreviewFontCache {
+    requested_family: String,
+    font: Font,
 }
 
 fn parse_primary_order_by_clause(order_by_clause: &str) -> Option<(String, ColumnSort)> {
@@ -194,12 +204,14 @@ impl Clone for EditorTableDelegate {
             active_filter_columns: self.active_filter_columns.clone(),
             filtered_row_indices: self.filtered_row_indices.clone(),
             column_filters: self.column_filters.clone(),
+            row_search_query: self.row_search_query.clone(),
             editable: self.editable,
             loading: self.loading,
-            database_type: self.database_type,
+            database_type: self.database_type.clone(),
             table_name: self.table_name.clone(),
             primary_key_indices: self.primary_key_indices.clone(),
             data_grid: self.data_grid.clone(),
+            preview_font_cache: self.preview_font_cache.clone(),
         }
     }
 }
@@ -232,13 +244,32 @@ impl EditorTableDelegate {
             active_filter_columns: HashSet::new(),
             filtered_row_indices: None,
             column_filters: HashMap::new(),
+            row_search_query: String::new(),
             editable,
             loading: false,
             database_type,
             table_name: SharedString::default(),
             primary_key_indices: Vec::new(),
             data_grid: None,
+            preview_font_cache: None,
         }
+    }
+
+    fn preview_font(&mut self, cx: &mut Context<EditTableState<Self>>) -> Font {
+        let font_family = AppSettings::global(cx).table_preview_font_family.clone();
+        if let Some(cache) = &self.preview_font_cache
+            && cache.requested_family == font_family
+        {
+            return cache.font.clone();
+        }
+
+        let installed_font_names = cx.text_system().all_font_names();
+        let font = installed_grid_monospace_font(&font_family, &installed_font_names);
+        self.preview_font_cache = Some(PreviewFontCache {
+            requested_family: font_family,
+            font: font.clone(),
+        });
+        font
     }
 
     pub fn set_data_grid(&mut self, data_grid: WeakEntity<DataGrid>) {
@@ -326,7 +357,7 @@ impl EditorTableDelegate {
         self.column_meta
             .get(col_ix)
             .map(|m| {
-                let field_type = FieldType::from_db_type(&*m.data_type);
+                let field_type = FieldType::from_db_type(&m.data_type);
                 // Oracle DATE contains both date and time
                 if field_type == FieldType::Date && self.database_type == DatabaseType::Oracle {
                     FieldType::DateTime
@@ -452,6 +483,7 @@ impl EditorTableDelegate {
 
         // Clear all change tracking
         self.clear_changes();
+        self.recalculate_filtered_indices();
     }
 
     pub fn apply_order_by_clause(&mut self, order_by_clause: &str) {
@@ -621,9 +653,7 @@ impl EditorTableDelegate {
         self.clear_changes();
 
         // Recalculate filter results with restored data
-        if !self.column_filters.is_empty() {
-            self.recalculate_filtered_indices();
-        }
+        self.recalculate_filtered_indices();
     }
 
     /// Check if there are any pending changes
@@ -730,12 +760,34 @@ impl EditorTableDelegate {
     pub fn clear_all_filters(&mut self) {
         self.column_filters.clear();
         self.active_filter_columns.clear();
-        self.filtered_row_indices = None;
+        self.recalculate_filtered_indices();
     }
 
-    /// 重新计算筛选后的行索引（多列 AND 组合）
+    pub fn set_row_search_query(&mut self, query: impl Into<String>) {
+        self.row_search_query = normalize_row_search_query(&query.into());
+        self.recalculate_filtered_indices();
+    }
+
+    fn has_active_filters(&self) -> bool {
+        !self.column_filters.is_empty() || !self.row_search_query.is_empty()
+    }
+
+    fn row_matches_column_filters(&self, row: &[Option<String>]) -> bool {
+        self.column_filters
+            .iter()
+            .all(|(&col_ix, selected_values)| {
+                let cell_value = row
+                    .get(col_ix)
+                    .and_then(|opt| opt.as_ref())
+                    .map(|s| s.as_str())
+                    .unwrap_or("NULL");
+                selected_values.contains(cell_value)
+            })
+    }
+
+    /// 重新计算筛选后的行索引（列筛选和本地搜索使用 AND 组合）
     fn recalculate_filtered_indices(&mut self) {
-        if self.column_filters.is_empty() {
+        if !self.has_active_filters() {
             self.filtered_row_indices = None;
             return;
         }
@@ -744,19 +796,8 @@ impl EditorTableDelegate {
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| {
-                // 所有筛选条件都必须满足（AND）
-                self.column_filters
-                    .iter()
-                    .all(|(&col_ix, selected_values)| {
-                        let cell_value = row
-                            .get(col_ix)
-                            .and_then(|opt| opt.as_ref())
-                            .map(|s| s.as_str())
-                            .unwrap_or("NULL");
-                        selected_values.contains(cell_value)
-                    })
-            })
+            .filter(|(_, row)| self.row_matches_column_filters(row))
+            .filter(|(_, row)| row_matches_search_query(row, &self.row_search_query))
             .map(|(ix, _)| ix)
             .collect();
 
@@ -767,6 +808,18 @@ impl EditorTableDelegate {
             self.filtered_row_indices = Some(filtered_indices);
         }
     }
+}
+
+fn normalize_row_search_query(query: &str) -> String {
+    query.trim().to_lowercase()
+}
+
+fn row_matches_search_query(row: &[Option<String>], normalized_query: &str) -> bool {
+    normalized_query.is_empty()
+        || row.iter().any(|cell| {
+            let value = cell.as_deref().unwrap_or("NULL").to_lowercase();
+            value.contains(normalized_query)
+        })
 }
 
 impl EditTableDelegate for EditorTableDelegate {
@@ -826,7 +879,7 @@ impl EditTableDelegate for EditorTableDelegate {
         &mut self,
         col_ix: usize,
         _window: &mut Window,
-        _: &mut Context<EditTableState<Self>>,
+        cx: &mut Context<EditTableState<Self>>,
     ) -> impl IntoElement {
         let col_name = self
             .columns
@@ -842,15 +895,18 @@ impl EditTableDelegate for EditorTableDelegate {
                 if let Some(comment) = &meta.comment {
                     if !comment.is_empty() {
                         text.push('\n');
-                        text.push_str(&*comment);
+                        text.push_str(comment);
                     }
                 }
                 text
             })
             .unwrap_or_default();
 
+        let font = self.preview_font(cx);
+
         h_flex()
             .id(SharedString::from(format!("col-{}", col_ix)))
+            .font(font)
             .size_full()
             .items_center()
             .justify_between()
@@ -1327,12 +1383,23 @@ impl EditTableDelegate for EditorTableDelegate {
             .cloned()
             .unwrap_or(None);
 
+        let font = self.preview_font(cx);
+
         match value {
             None => div()
+                .font(font.clone())
                 .text_color(cx.theme().muted_foreground.opacity(0.5))
                 .italic()
                 .child("NULL"),
-            Some(s) => div().child(s),
+            Some(s) => {
+                div()
+                    .font(font)
+                    .w_full()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(s)
+            }
         }
     }
 
@@ -2021,7 +2088,7 @@ impl EditTableDelegate for EditorTableDelegate {
                 selected_values.contains(cell_value)
             });
 
-            if passes_other_filters {
+            if passes_other_filters && row_matches_search_query(row, &self.row_search_query) {
                 let value = row
                     .get(col_ix)
                     .and_then(|opt| opt.clone())
@@ -2244,14 +2311,51 @@ impl EditorTableDelegate {
 
     /// 获取数据库类型
     pub fn database_type(&self) -> DatabaseType {
-        self.database_type
+        self.database_type.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_sort_identifier, parse_primary_order_by_clause};
-    use one_ui::edit_table::ColumnSort;
+    use super::{
+        EditorTableDelegate, normalize_row_search_query, normalize_sort_identifier,
+        parse_primary_order_by_clause, row_matches_search_query,
+    };
+    use db::ColumnInfo;
+    use gpui::SharedString;
+    use one_core::storage::DatabaseType;
+    use one_ui::edit_table::{Column, ColumnSort};
+    use std::collections::{HashMap, HashSet};
+
+    fn test_delegate(rows: Vec<Vec<Option<String>>>) -> EditorTableDelegate {
+        let row_count = rows.len();
+        EditorTableDelegate {
+            columns: vec![Column::new("id", "id"), Column::new("name", "name")],
+            column_meta: Vec::<ColumnInfo>::new(),
+            original_rows: rows.clone(),
+            rows,
+            rowids: Vec::new(),
+            original_rowids: Vec::new(),
+            row_status: HashMap::new(),
+            cell_changes: HashMap::new(),
+            modified_cells: HashSet::new(),
+            deleted_original_rows: HashSet::new(),
+            row_index_map: (0..row_count).map(|i| (i, i)).collect(),
+            next_new_row_id: 1_000_000,
+            new_rows: HashMap::new(),
+            active_filter_columns: HashSet::new(),
+            filtered_row_indices: None,
+            column_filters: HashMap::new(),
+            row_search_query: String::new(),
+            editable: true,
+            loading: false,
+            database_type: DatabaseType::MySQL,
+            table_name: SharedString::default(),
+            primary_key_indices: Vec::new(),
+            data_grid: None,
+            preview_font_cache: None,
+        }
+    }
 
     #[test]
     fn parse_primary_order_by_clause_uses_first_segment() {
@@ -2279,5 +2383,91 @@ mod tests {
         assert_eq!(normalize_sort_identifier("\"created_at\""), "created_at");
         assert_eq!(normalize_sort_identifier("[Order Detail]"), "order detail");
         assert_eq!(normalize_sort_identifier("t.\"user_id\""), "user_id");
+    }
+
+    #[test]
+    fn row_search_normalizes_whitespace_and_case() {
+        assert_eq!(normalize_row_search_query("  ALIce  "), "alice");
+    }
+
+    #[test]
+    fn row_search_matches_cells_case_insensitively() {
+        let row = vec![Some("1".to_string()), Some("Alice Zhang".to_string())];
+
+        assert!(row_matches_search_query(&row, "alice"));
+        assert!(row_matches_search_query(&row, "zhang"));
+        assert!(!row_matches_search_query(&row, "bob"));
+    }
+
+    #[test]
+    fn row_search_matches_null_cells() {
+        let row = vec![Some("1".to_string()), None];
+
+        assert!(row_matches_search_query(&row, "null"));
+    }
+
+    #[test]
+    fn row_search_filters_visible_rows() {
+        let mut delegate = test_delegate(vec![
+            vec![Some("1".to_string()), Some("Alice".to_string())],
+            vec![Some("2".to_string()), Some("Bob".to_string())],
+        ]);
+
+        delegate.set_row_search_query("ali");
+
+        assert_eq!(1, delegate.filtered_row_count());
+        assert_eq!(Some(0), delegate.resolve_display_row(0));
+        assert_eq!(None, delegate.resolve_display_row(1));
+    }
+
+    #[test]
+    fn row_search_combines_with_column_filters() {
+        let mut delegate = test_delegate(vec![
+            vec![Some("active".to_string()), Some("Alice".to_string())],
+            vec![Some("inactive".to_string()), Some("Alice".to_string())],
+            vec![Some("active".to_string()), Some("Bob".to_string())],
+        ]);
+
+        delegate.apply_filter(0, HashSet::from(["active".to_string()]));
+        delegate.set_row_search_query("alice");
+
+        assert_eq!(1, delegate.filtered_row_count());
+        assert_eq!(Some(0), delegate.resolve_display_row(0));
+        assert_eq!(None, delegate.resolve_display_row(1));
+    }
+
+    #[test]
+    fn table_render_uses_cached_preview_font() {
+        let source = include_str!("results_delegate.rs");
+        let preview_font = source
+            .split("fn preview_font(")
+            .nth(1)
+            .expect("preview_font helper exists")
+            .split("pub fn set_data_grid")
+            .next()
+            .expect("preview_font helper has an end marker");
+        let render_th = source
+            .split("fn render_th(")
+            .nth(1)
+            .expect("render_th exists")
+            .split("fn context_menu(")
+            .next()
+            .expect("render_th has an end marker");
+        let render_td = source
+            .split("fn render_td(")
+            .nth(1)
+            .expect("render_td exists")
+            .split("fn loading(")
+            .next()
+            .expect("render_td has an end marker");
+
+        assert!(preview_font.contains("cache.requested_family == font_family"));
+        assert!(preview_font.contains("cx.text_system().all_font_names()"));
+        assert!(preview_font.contains("installed_grid_monospace_font("));
+        assert!(!preview_font.contains("installed_business_grid_monospace_font("));
+        assert!(!preview_font.contains("cache.installed_font_names == installed_font_names"));
+        assert!(!preview_font.contains("installed_font_names,"));
+        assert!(!render_th.contains("cx.text_system().all_font_names()"));
+        assert!(!render_td.contains("cx.text_system().all_font_names()"));
     }
 }

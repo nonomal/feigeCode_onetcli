@@ -8,13 +8,15 @@
 
 use crate::TerminalTheme;
 use crate::addon::{AddonManager, CellDecoration, DecorationSpan};
+use crate::view::block_selection::BlockSelectionBounds;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::term::{RenderableContent, Term, TermDamage, TermMode};
+use alacritty_terminal::term::{RenderableContent, Term, TermDamage};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use gpui::*;
+use one_core::settings::default_grid_font_fallback_families;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -27,6 +29,10 @@ pub struct FontVariants {
     pub bold: Font,
     pub italic: Font,
     pub bold_italic: Font,
+    pub cjk_normal: Font,
+    pub cjk_bold: Font,
+    pub cjk_italic: Font,
+    pub cjk_bold_italic: Font,
 }
 
 impl FontVariants {
@@ -40,6 +46,7 @@ impl FontVariants {
 
         // 只禁用 calt（上下文替代），避免等宽字符出现连字影响栅格对齐
         let features = FontFeatures(Arc::new(vec![("calt".to_string(), 0)]));
+        let cjk_family = terminal_cjk_font_family();
 
         Self {
             normal: Font {
@@ -67,6 +74,34 @@ impl FontVariants {
                 family,
                 weight: FontWeight::BOLD,
                 style: FontStyle::Italic,
+                features: features.clone(),
+                fallbacks: fallbacks.clone(),
+            },
+            cjk_normal: Font {
+                family: cjk_family.clone(),
+                weight: FontWeight::NORMAL,
+                style: FontStyle::Normal,
+                features: features.clone(),
+                fallbacks: fallbacks.clone(),
+            },
+            cjk_bold: Font {
+                family: cjk_family.clone(),
+                weight: FontWeight::BOLD,
+                style: FontStyle::Normal,
+                features: features.clone(),
+                fallbacks: fallbacks.clone(),
+            },
+            cjk_italic: Font {
+                family: cjk_family.clone(),
+                weight: FontWeight::NORMAL,
+                style: FontStyle::Italic,
+                features: features.clone(),
+                fallbacks: fallbacks.clone(),
+            },
+            cjk_bold_italic: Font {
+                family: cjk_family,
+                weight: FontWeight::BOLD,
+                style: FontStyle::Italic,
                 features,
                 fallbacks,
             },
@@ -74,14 +109,26 @@ impl FontVariants {
     }
 
     #[inline]
-    pub fn get(&self, bold: bool, italic: bool) -> &Font {
-        match (bold, italic) {
-            (false, false) => &self.normal,
-            (true, false) => &self.bold,
-            (false, true) => &self.italic,
-            (true, true) => &self.bold_italic,
+    pub fn get(&self, role: TextRunFontRole, bold: bool, italic: bool) -> &Font {
+        match (role, bold, italic) {
+            (TextRunFontRole::Primary, false, false) => &self.normal,
+            (TextRunFontRole::Primary, true, false) => &self.bold,
+            (TextRunFontRole::Primary, false, true) => &self.italic,
+            (TextRunFontRole::Primary, true, true) => &self.bold_italic,
+            (TextRunFontRole::CjkFallback, false, false) => &self.cjk_normal,
+            (TextRunFontRole::CjkFallback, true, false) => &self.cjk_bold,
+            (TextRunFontRole::CjkFallback, false, true) => &self.cjk_italic,
+            (TextRunFontRole::CjkFallback, true, true) => &self.cjk_bold_italic,
         }
     }
+}
+
+fn terminal_cjk_font_family() -> SharedString {
+    default_grid_font_fallback_families()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "Noto Sans CJK SC".to_string())
+        .into()
 }
 
 /// 检查是否为装饰字符（边框、块元素、Powerline 等）
@@ -96,6 +143,33 @@ fn is_decorative_character(ch: char) -> bool {
         | 0x25A0..=0x25FF   // Geometric Shapes: ■ □ ▪ ▫ ● ○
         | 0xE0B0..=0xE0D7   // Powerline symbols
         | 0x2800..=0x28FF   // Braille Patterns
+    )
+}
+
+#[inline]
+fn terminal_text_font_role(ch: char) -> TextRunFontRole {
+    if is_cjk_terminal_character(ch) {
+        TextRunFontRole::CjkFallback
+    } else {
+        TextRunFontRole::Primary
+    }
+}
+
+#[inline]
+fn is_cjk_terminal_character(ch: char) -> bool {
+    let code = ch as u32;
+    matches!(
+        code,
+        0x3000..=0x303F   // CJK Symbols and Punctuation
+        | 0x3040..=0x309F // Hiragana
+        | 0x30A0..=0x30FF // Katakana
+        | 0x31F0..=0x31FF // Katakana Phonetic Extensions
+        | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
+        | 0x4E00..=0x9FFF // CJK Unified Ideographs
+        | 0xAC00..=0xD7AF // Hangul Syllables
+        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+        | 0xFF00..=0xFFEF // Halfwidth and Fullwidth Forms
+        | 0x20000..=0x2FA1F // CJK Unified Ideographs Extensions
     )
 }
 
@@ -266,9 +340,17 @@ impl DecorationManager {
 #[derive(Clone)]
 pub struct CachedLine {
     pub background_rects: Vec<(usize, usize, Hsla)>,
+    pub underline_rects: Vec<CachedUnderlineRect>,
     pub text_runs: Vec<CachedTextRun>,
     /// 块状字符（U+2580..U+259F）使用几何绘制，避免字体回退导致的接缝
     pub block_glyphs: Vec<CachedBlockGlyph>,
+}
+
+#[derive(Clone)]
+pub struct CachedUnderlineRect {
+    pub start_col: usize,
+    pub end_col: usize,
+    pub color: Hsla,
 }
 
 #[derive(Clone)]
@@ -279,7 +361,15 @@ pub struct CachedTextRun {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
-    pub char_count: usize,
+    pub cell_width_cols: usize,
+    pub column_count: usize,
+    pub font_role: TextRunFontRole,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextRunFontRole {
+    Primary,
+    CjkFallback,
 }
 
 /// 单个 cell 内的几何块字符渲染数据
@@ -320,6 +410,8 @@ pub struct RenderCache {
 
     /// 上一帧的选择范围，用于增量更新
     last_selection: Option<SelectionRange>,
+    /// 上一帧的块选择范围，用于增量更新
+    last_block_selection: Option<BlockSelectionBounds>,
 
     /// 左边缘列指纹（用于检测脏区漏报导致的首列残字）
     left_edge_fingerprint: Vec<u64>,
@@ -330,6 +422,36 @@ struct CachedCursor {
     column: usize,
     line: usize,
     shape: CursorShape,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockCursorGlyph {
+    character: char,
+    font_role: TextRunFontRole,
+    bold: bool,
+    italic: bool,
+    cell_width_cols: usize,
+}
+
+fn block_cursor_glyph_at(line: &CachedLine, column: usize) -> Option<BlockCursorGlyph> {
+    line.text_runs.iter().find_map(|run| {
+        let offset = column.checked_sub(run.start_col)?;
+        if run.cell_width_cols == 0
+            || offset >= run.column_count
+            || offset % run.cell_width_cols != 0
+        {
+            return None;
+        }
+
+        let character = run.text.chars().nth(offset / run.cell_width_cols)?;
+        Some(BlockCursorGlyph {
+            character,
+            font_role: run.font_role,
+            bold: run.bold,
+            italic: run.italic,
+            cell_width_cols: run.cell_width_cols,
+        })
+    })
 }
 
 enum DamageSnapshot {
@@ -356,6 +478,7 @@ impl RenderCache {
             lines: vec![
                 CachedLine {
                     background_rects: Vec::new(),
+                    underline_rects: Vec::new(),
                     text_runs: Vec::new(),
                     block_glyphs: Vec::new(),
                 };
@@ -371,30 +494,24 @@ impl RenderCache {
             custom_background: rgb(0x1E1E1E).into(),
             custom_cursor: rgb(0xFFFFFF).into(),
             last_selection: None,
+            last_block_selection: None,
             left_edge_fingerprint: vec![0; num_lines],
         }
     }
 
     /// Update cache based on terminal damage, with incremental selection support
-    pub fn update(
+    pub(crate) fn update(
         &mut self,
         term: &mut Term<GpuiEventProxy>,
         addon_manager: &AddonManager,
         theme: &TerminalTheme,
+        block_selection: Option<BlockSelectionBounds>,
     ) {
         let num_cols = term.columns();
         let num_lines = term.screen_lines();
 
         // Handle resize
         if num_lines != self.num_lines || num_cols != self.num_cols {
-            tracing::info!(
-                target: "terminal_residue",
-                old_lines = self.num_lines,
-                old_cols = self.num_cols,
-                new_lines = num_lines,
-                new_cols = num_cols,
-                "RenderCache::resize"
-            );
             self.resize(num_lines, num_cols);
         }
 
@@ -431,39 +548,17 @@ impl RenderCache {
         // 主题颜色变化或存在装饰时保守全量重建。
         let has_decorations = !self.decoration_manager.decorations_by_line.is_empty();
         if fg_changed || bg_changed || colors_changed || has_decorations {
-            tracing::debug!(
-                target: "terminal_residue",
-                fg_changed,
-                bg_changed,
-                colors_changed,
-                has_decorations,
-                num_lines,
-                "rebuild_all (forced by theme/decoration)"
-            );
-            self.rebuild_all_and_update_state(term);
+            self.rebuild_all_and_update_state(term, block_selection);
             return;
         }
 
         let mut dirty_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
         match damage {
             DamageSnapshot::Full => {
-                tracing::debug!(
-                    target: "terminal_residue",
-                    num_lines,
-                    "rebuild_all (TermDamage::Full)"
-                );
-                self.rebuild_all_and_update_state(term);
+                self.rebuild_all_and_update_state(term, block_selection);
                 return;
             }
             DamageSnapshot::Partial(lines) => {
-                if !lines.is_empty() {
-                    tracing::debug!(
-                        target: "terminal_residue",
-                        damaged = ?lines,
-                        num_lines,
-                        "Partial damage"
-                    );
-                }
                 dirty_lines.extend(lines);
             }
         }
@@ -491,6 +586,15 @@ impl RenderCache {
             }
         }
 
+        if self.last_block_selection != block_selection {
+            let block_selection_lines = self
+                .compute_block_selection_changed_lines(self.last_block_selection, block_selection);
+            for line in block_selection_lines {
+                dirty_lines.insert(line);
+            }
+            self.last_block_selection = block_selection;
+        }
+
         // 首列兜底：检测左边缘变化但未被 damage 标记的行。
         let edge_changed_lines = self.detect_left_edge_changed_lines(term, 4);
         for line in &edge_changed_lines {
@@ -502,7 +606,7 @@ impl RenderCache {
             self.update_cursor(term);
         } else {
             let lines: Vec<usize> = dirty_lines.into_iter().collect();
-            self.rebuild_lines(term, &lines);
+            self.rebuild_lines(term, &lines, block_selection);
         }
     }
 
@@ -513,6 +617,7 @@ impl RenderCache {
             num_lines,
             CachedLine {
                 background_rects: Vec::new(),
+                underline_rects: Vec::new(),
                 text_runs: Vec::new(),
                 block_glyphs: Vec::new(),
             },
@@ -520,13 +625,22 @@ impl RenderCache {
         self.left_edge_fingerprint.resize(num_lines, 0);
     }
 
-    fn rebuild_all_and_update_state(&mut self, term: &Term<GpuiEventProxy>) {
-        self.rebuild_all(term);
+    fn rebuild_all_and_update_state(
+        &mut self,
+        term: &Term<GpuiEventProxy>,
+        block_selection: Option<BlockSelectionBounds>,
+    ) {
+        self.rebuild_all(term, block_selection);
         self.update_last_selection(term);
+        self.last_block_selection = block_selection;
         self.sync_left_edge_fingerprint(term, 4);
     }
 
-    fn rebuild_all(&mut self, term: &Term<GpuiEventProxy>) {
+    fn rebuild_all(
+        &mut self,
+        term: &Term<GpuiEventProxy>,
+        block_selection: Option<BlockSelectionBounds>,
+    ) {
         let content = term.renderable_content();
         let display_offset = content.display_offset;
         let selection = &content.selection;
@@ -534,6 +648,7 @@ impl RenderCache {
         // Clear all lines
         for line in &mut self.lines {
             line.background_rects.clear();
+            line.underline_rects.clear();
             line.text_runs.clear();
             line.block_glyphs.clear();
         }
@@ -547,10 +662,15 @@ impl RenderCache {
                 continue;
             }
 
-            let is_selected = selection
-                .as_ref()
-                .map(|s: &SelectionRange| s.contains(cell.point))
-                .unwrap_or(false);
+            let is_selected = block_selection
+                .map(|bounds| {
+                    bounds.contains_screen_cell(screen_line as usize, cell.point.column.0)
+                })
+                .unwrap_or(false)
+                || selection
+                    .as_ref()
+                    .map(|s: &SelectionRange| s.contains(cell.point))
+                    .unwrap_or(false);
 
             line_cells[screen_line as usize].push(CellData {
                 column: cell.point.column.0,
@@ -570,38 +690,15 @@ impl RenderCache {
         // Update cursor from a fresh content
         let content = term.renderable_content();
         self.update_cursor_from_content(&content);
-
-        // 调试日志:统计 cache 重建后各行的内容分布。
-        // 关注底部最后 8 行,若 TUI 仅画了上半部,底部 8 行的 text/bg 应该为空。
-        let total = self.lines.len();
-        let non_empty_lines = self
-            .lines
-            .iter()
-            .filter(|l| !l.text_runs.is_empty() || !l.background_rects.is_empty())
-            .count();
-        let mut tail_summary = Vec::new();
-        let tail_start = total.saturating_sub(8);
-        for idx in tail_start..total {
-            let l = &self.lines[idx];
-            tail_summary.push(format!(
-                "[{idx}] bg={} text={} chars={}",
-                l.background_rects.len(),
-                l.text_runs.len(),
-                l.text_runs.iter().map(|r| r.char_count).sum::<usize>(),
-            ));
-        }
-        tracing::debug!(
-            target: "terminal_residue",
-            total_lines = total,
-            non_empty_lines,
-            in_alt_screen = content.mode.contains(TermMode::ALT_SCREEN),
-            tail = tail_summary.join(" | "),
-            "rebuild_all done"
-        );
     }
 
     /// Rebuild specified lines
-    fn rebuild_lines(&mut self, term: &Term<GpuiEventProxy>, lines: &[usize]) {
+    fn rebuild_lines(
+        &mut self,
+        term: &Term<GpuiEventProxy>,
+        lines: &[usize],
+        block_selection: Option<BlockSelectionBounds>,
+    ) {
         let content = term.renderable_content();
         let display_offset = content.display_offset;
         let selection = &content.selection;
@@ -622,10 +719,13 @@ impl RenderCache {
                 continue;
             }
 
-            let is_selected = selection
-                .as_ref()
-                .map(|s: &SelectionRange| s.contains(cell.point))
-                .unwrap_or(false);
+            let is_selected = block_selection
+                .map(|bounds| bounds.contains_screen_cell(line_idx, cell.point.column.0))
+                .unwrap_or(false)
+                || selection
+                    .as_ref()
+                    .map(|s: &SelectionRange| s.contains(cell.point))
+                    .unwrap_or(false);
 
             line_cells[line_idx].push(CellData {
                 column: cell.point.column.0,
@@ -641,6 +741,7 @@ impl RenderCache {
         for &line_idx in &lines_set {
             if line_idx < self.num_lines {
                 self.lines[line_idx].background_rects.clear();
+                self.lines[line_idx].underline_rects.clear();
                 self.lines[line_idx].text_runs.clear();
                 self.lines[line_idx].block_glyphs.clear();
                 let cells = std::mem::take(&mut line_cells[line_idx]);
@@ -683,6 +784,34 @@ impl RenderCache {
         }
 
         changed_lines
+    }
+
+    fn compute_block_selection_changed_lines(
+        &self,
+        old_selection: Option<BlockSelectionBounds>,
+        new_selection: Option<BlockSelectionBounds>,
+    ) -> Vec<usize> {
+        let mut changed_lines = Vec::new();
+        self.push_block_selection_lines(old_selection, &mut changed_lines);
+        self.push_block_selection_lines(new_selection, &mut changed_lines);
+        changed_lines
+    }
+
+    fn push_block_selection_lines(
+        &self,
+        selection: Option<BlockSelectionBounds>,
+        changed_lines: &mut Vec<usize>,
+    ) {
+        let Some(selection) = selection else {
+            return;
+        };
+        let start_line = selection.start_line.max(0) as usize;
+        let end_line = selection.end_line.max(0) as usize;
+        for line in start_line..=end_line.min(self.num_lines.saturating_sub(1)) {
+            if !changed_lines.contains(&line) {
+                changed_lines.push(line);
+            }
+        }
     }
 
     /// Update the last_selection tracking field
@@ -772,6 +901,7 @@ impl RenderCache {
 
         let line = &mut self.lines[line_idx];
         let mut bg_span: Option<(usize, Hsla)> = None;
+        let mut underline_span: Option<(usize, Hsla)> = None;
         let mut text_run: Option<CachedTextRun> = None;
 
         for cell in &cells {
@@ -795,6 +925,9 @@ impl RenderCache {
                 fg = deco_fg;
                 bg = deco_bg;
                 underline = deco_underline;
+            }
+            if !cell.is_selected && terminal_underline_flags(cell.flags) {
+                underline = true;
             }
 
             // Apply custom foreground for default foreground color (lowest priority)
@@ -846,6 +979,29 @@ impl RenderCache {
                 }
             }
 
+            if underline {
+                match &mut underline_span {
+                    Some((_, span_color)) if hsla_eq(*span_color, fg) => {}
+                    Some((start, color)) => {
+                        line.underline_rects.push(CachedUnderlineRect {
+                            start_col: *start,
+                            end_col: cell.column,
+                            color: *color,
+                        });
+                        underline_span = Some((cell.column, fg));
+                    }
+                    None => {
+                        underline_span = Some((cell.column, fg));
+                    }
+                }
+            } else if let Some((start, color)) = underline_span.take() {
+                line.underline_rects.push(CachedUnderlineRect {
+                    start_col: start,
+                    end_col: cell.column,
+                    color,
+                });
+            }
+
             // Skip wide character spacer
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
@@ -874,11 +1030,19 @@ impl RenderCache {
 
             let bold = cell.flags.contains(Flags::BOLD);
             let italic = cell.flags.contains(Flags::ITALIC);
+            let cell_width_cols = if cell.flags.contains(Flags::WIDE_CHAR) {
+                2
+            } else {
+                1
+            };
+            let font_role = terminal_text_font_role(cell.c);
 
             // Check if we can merge with existing run
             let can_merge = if let Some(ref run) = text_run {
                 // Merge only if columns are consecutive
-                run.start_col + run.char_count == cell.column
+                run.start_col + run.column_count == cell.column
+                    && run.cell_width_cols == cell_width_cols
+                    && run.font_role == font_role
                     && hsla_eq(run.color, fg)
                     && run.bold == bold
                     && run.italic == italic
@@ -890,7 +1054,7 @@ impl RenderCache {
             if can_merge {
                 let run = text_run.as_mut().unwrap();
                 run.text.push(cell.c);
-                run.char_count += 1;
+                run.column_count += cell_width_cols;
             } else {
                 if let Some(run) = text_run.take() {
                     line.text_runs.push(run);
@@ -902,7 +1066,9 @@ impl RenderCache {
                     bold,
                     italic,
                     underline,
-                    char_count: 1,
+                    cell_width_cols,
+                    column_count: cell_width_cols,
+                    font_role,
                 });
             }
         }
@@ -910,6 +1076,13 @@ impl RenderCache {
         // Flush remaining
         if let Some((start, color)) = bg_span {
             line.background_rects.push((start, self.num_cols, color));
+        }
+        if let Some((start, color)) = underline_span {
+            line.underline_rects.push(CachedUnderlineRect {
+                start_col: start,
+                end_col: self.num_cols,
+                color,
+            });
         }
         if let Some(run) = text_run {
             line.text_runs.push(run);
@@ -1151,16 +1324,6 @@ impl Element for TerminalElementImpl {
 
         let intersection = content_mask.intersect(&terminal_bounds);
         if intersection.size.height <= px(0.) || intersection.size.width <= px(0.) {
-            tracing::debug!(
-                target: "terminal_residue",
-                lines = self.lines.len(),
-                num_cols = self.num_cols,
-                cell_w = ?tb.cell_width,
-                cell_h = ?tb.cell_height,
-                origin = ?tb.origin,
-                content_mask = ?content_mask,
-                "paint skipped (no intersection)"
-            );
             return; // 完全不可见，跳过渲染
         }
 
@@ -1177,26 +1340,6 @@ impl Element for TerminalElementImpl {
             / tb.cell_height)
             .ceil() as usize;
         let visible_end = last_visible.min(self.lines.len());
-
-        // 仅在统计行数 / 像素差异时记录一次,避免每帧爆量
-        let cm_h: f32 = content_mask.size.height.into();
-        let tb_h: f32 = terminal_height.into();
-        if (cm_h - tb_h).abs() > 0.5 || self.lines.len() < visible_end {
-            tracing::debug!(
-                target: "terminal_residue",
-                lines = self.lines.len(),
-                num_cols = self.num_cols,
-                cell_w = ?tb.cell_width,
-                cell_h = ?tb.cell_height,
-                origin = ?tb.origin,
-                terminal_bounds_h = ?terminal_height,
-                content_mask = ?content_mask,
-                first_visible,
-                visible_end,
-                bg_alpha = self.custom_background.a,
-                "paint metrics"
-            );
-        }
 
         // Paint backgrounds (only visible lines)
         for line_idx in first_visible..visible_end {
@@ -1233,7 +1376,7 @@ impl Element for TerminalElementImpl {
         for line_idx in first_visible..visible_end {
             let line = &self.lines[line_idx];
             for run in &line.text_runs {
-                let font = fonts.get(run.bold, run.italic);
+                let font = fonts.get(run.font_role, run.bold, run.italic);
 
                 let underline = if run.underline {
                     Some(UnderlineStyle {
@@ -1256,7 +1399,7 @@ impl Element for TerminalElementImpl {
                         underline,
                         strikethrough: None,
                     }],
-                    Some(tb.cell_width),
+                    Some(tb.cell_width * run.cell_width_cols as f32),
                 );
                 let _ = shaped.paint(
                     tb.cell_origin(line_idx, run.start_col),
@@ -1266,6 +1409,22 @@ impl Element for TerminalElementImpl {
                     window,
                     cx,
                 );
+            }
+        }
+
+        // Paint terminal underline attributes as cell-level decorations so
+        // cursorline underlines remain visible even on blank cells.
+        for line_idx in first_visible..visible_end {
+            let line = &self.lines[line_idx];
+            for underline in &line.underline_rects {
+                let thickness = px(1.0);
+                let origin = tb.cell_origin(line_idx, underline.start_col);
+                let width = tb.cell_width * (underline.end_col - underline.start_col) as f32;
+                let rect = Bounds::new(
+                    Point::new(origin.x, origin.y + tb.cell_height - thickness),
+                    size(width, thickness),
+                );
+                window.paint_quad(fill(rect, underline.color));
             }
         }
 
@@ -1281,7 +1440,44 @@ impl Element for TerminalElementImpl {
 
                     match cursor.shape {
                         CursorShape::Block => {
-                            window.paint_quad(fill(cursor_bounds, cursor_color));
+                            let glyph =
+                                block_cursor_glyph_at(&self.lines[cursor.line], cursor.column);
+                            let cursor_width_cols = glyph.map_or(1, |glyph| glyph.cell_width_cols);
+                            let block_bounds = Bounds::new(
+                                cursor_bounds.origin,
+                                size(tb.cell_width * cursor_width_cols as f32, tb.cell_height),
+                            );
+                            window.paint_quad(fill(block_bounds, cursor_color));
+
+                            if let Some(glyph) = glyph {
+                                let text = glyph.character.to_string();
+                                let text_len = text.len();
+                                let font = fonts.get(glyph.font_role, glyph.bold, glyph.italic);
+                                let shaped = window.text_system().shape_line(
+                                    text.into(),
+                                    self.font_size,
+                                    &[TextRun {
+                                        len: text_len,
+                                        font: font.clone(),
+                                        color: ensure_minimum_contrast(
+                                            self.custom_background,
+                                            cursor_color,
+                                        ),
+                                        background_color: None,
+                                        underline: None,
+                                        strikethrough: None,
+                                    }],
+                                    Some(block_bounds.size.width),
+                                );
+                                let _ = shaped.paint(
+                                    block_bounds.origin,
+                                    tb.cell_height,
+                                    TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            }
                         }
                         CursorShape::Underline => {
                             let h = px(2.0);
@@ -1337,6 +1533,17 @@ fn colors_equal(a: &Colors, b: &Colors) -> bool {
         }
     }
     true
+}
+
+#[inline]
+fn terminal_underline_flags(flags: Flags) -> bool {
+    flags.intersects(
+        Flags::UNDERLINE
+            | Flags::DOUBLE_UNDERLINE
+            | Flags::UNDERCURL
+            | Flags::DOTTED_UNDERLINE
+            | Flags::DASHED_UNDERLINE,
+    )
 }
 
 #[inline]
@@ -1518,7 +1725,13 @@ fn indexed_color_to_hsla(idx: u8) -> Hsla {
 
 #[cfg(test)]
 mod tests {
-    use super::{BlockRect, block_element_geometry};
+    use super::{
+        BlockRect, CachedLine, CachedTextRun, CellData, RenderCache, TextRunFontRole,
+        block_cursor_glyph_at, block_element_geometry, terminal_text_font_role,
+    };
+    use alacritty_terminal::term::cell::Flags;
+    use alacritty_terminal::term::color::Colors;
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
 
     fn approx_eq(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-5
@@ -1532,6 +1745,145 @@ mod tests {
                 && approx_eq(actual.h, h),
             "expected ({x}, {y}, {w}, {h}) got {actual:?}"
         );
+    }
+
+    fn plain_cell(column: usize, c: char, flags: Flags) -> CellData {
+        CellData {
+            column,
+            c,
+            fg: Color::Named(NamedColor::Foreground),
+            bg: Color::Named(NamedColor::Background),
+            flags,
+            is_selected: false,
+        }
+    }
+
+    #[test]
+    fn text_run_tracks_terminal_columns_for_wide_characters() {
+        let mut cache = RenderCache::new(1, 8, Colors::default());
+        cache.build_line_cache(
+            0,
+            vec![
+                plain_cell(0, 'A', Flags::empty()),
+                plain_cell(1, '协', Flags::WIDE_CHAR),
+                plain_cell(3, '同', Flags::WIDE_CHAR),
+                plain_cell(5, 'B', Flags::empty()),
+            ],
+        );
+
+        let runs = &cache.lines[0].text_runs;
+        assert_eq!(3, runs.len());
+        assert_eq!("A", runs[0].text);
+        assert_eq!(0, runs[0].start_col);
+        assert_eq!(1, runs[0].cell_width_cols);
+        assert_eq!(1, runs[0].column_count);
+        assert_eq!(TextRunFontRole::Primary, runs[0].font_role);
+        assert_eq!("协同", runs[1].text);
+        assert_eq!(1, runs[1].start_col);
+        assert_eq!(2, runs[1].cell_width_cols);
+        assert_eq!(4, runs[1].column_count);
+        assert_eq!(TextRunFontRole::CjkFallback, runs[1].font_role);
+        assert_eq!("B", runs[2].text);
+        assert_eq!(5, runs[2].start_col);
+        assert_eq!(1, runs[2].cell_width_cols);
+        assert_eq!(1, runs[2].column_count);
+        assert_eq!(TextRunFontRole::Primary, runs[2].font_role);
+    }
+
+    #[test]
+    fn terminal_underline_flags_create_cell_decorations_including_spaces() {
+        let mut cache = RenderCache::new(1, 8, Colors::default());
+        cache.build_line_cache(
+            0,
+            vec![
+                plain_cell(0, 'A', Flags::UNDERLINE),
+                plain_cell(1, ' ', Flags::UNDERLINE),
+                plain_cell(2, 'B', Flags::empty()),
+            ],
+        );
+
+        let underlines = &cache.lines[0].underline_rects;
+        assert_eq!(1, underlines.len());
+        assert_eq!(0, underlines[0].start_col);
+        assert_eq!(2, underlines[0].end_col);
+    }
+
+    #[test]
+    fn terminal_text_font_role_routes_cjk_to_fallback_font() {
+        assert_eq!(TextRunFontRole::Primary, terminal_text_font_role('A'));
+        assert_eq!(TextRunFontRole::CjkFallback, terminal_text_font_role('协'));
+        assert_eq!(TextRunFontRole::CjkFallback, terminal_text_font_role('，'));
+        assert_eq!(TextRunFontRole::CjkFallback, terminal_text_font_role('あ'));
+    }
+
+    #[test]
+    fn block_cursor_glyph_keeps_the_character_under_the_cursor() {
+        let line = CachedLine {
+            background_rects: Vec::new(),
+            underline_rects: Vec::new(),
+            text_runs: vec![CachedTextRun {
+                start_col: 0,
+                text: "vim".to_string(),
+                color: gpui::Hsla::white(),
+                bold: false,
+                italic: false,
+                underline: false,
+                cell_width_cols: 1,
+                column_count: 3,
+                font_role: TextRunFontRole::Primary,
+            }],
+            block_glyphs: Vec::new(),
+        };
+
+        let glyph = block_cursor_glyph_at(&line, 1).expect("cursor glyph");
+
+        assert_eq!('i', glyph.character);
+        assert_eq!(1, glyph.cell_width_cols);
+        assert_eq!(TextRunFontRole::Primary, glyph.font_role);
+    }
+
+    #[test]
+    fn block_cursor_glyph_preserves_wide_character_width() {
+        let line = CachedLine {
+            background_rects: Vec::new(),
+            underline_rects: Vec::new(),
+            text_runs: vec![CachedTextRun {
+                start_col: 2,
+                text: "协同".to_string(),
+                color: gpui::Hsla::white(),
+                bold: true,
+                italic: false,
+                underline: false,
+                cell_width_cols: 2,
+                column_count: 4,
+                font_role: TextRunFontRole::CjkFallback,
+            }],
+            block_glyphs: Vec::new(),
+        };
+
+        let glyph = block_cursor_glyph_at(&line, 4).expect("wide cursor glyph");
+
+        assert_eq!('同', glyph.character);
+        assert_eq!(2, glyph.cell_width_cols);
+        assert!(glyph.bold);
+        assert_eq!(TextRunFontRole::CjkFallback, glyph.font_role);
+    }
+
+    #[test]
+    fn terminal_line_cache_preserves_unicode_format_characters() {
+        let mut cache = RenderCache::new(1, 8, Colors::default());
+        cache.build_line_cache(
+            0,
+            vec![
+                plain_cell(0, 'A', Flags::empty()),
+                plain_cell(1, '\u{200d}', Flags::empty()),
+                plain_cell(2, 'B', Flags::empty()),
+            ],
+        );
+
+        let runs = &cache.lines[0].text_runs;
+        assert_eq!(1, runs.len());
+        assert_eq!("A\u{200d}B", runs[0].text);
     }
 
     #[test]

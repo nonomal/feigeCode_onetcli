@@ -9,7 +9,7 @@ use gpui::{
     px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, IconName, IndexPath, Sizable, TitleBar, VirtualListScrollHandle,
+    ActiveTheme, Disableable, IconName, IndexPath, Sizable, VirtualListScrollHandle,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -350,7 +350,7 @@ impl DataExportView {
             .unwrap_or_default();
 
         Self {
-            connection_id: connection_id.into(),
+            connection_id,
             server_info: if let Some(c) = config {
                 c.server_info()
             } else {
@@ -437,6 +437,10 @@ impl DataExportView {
         });
     }
 
+    fn should_show_start_button(current_step: ExportStep, is_running: bool) -> bool {
+        current_step == ExportStep::Execute && !is_running
+    }
+
     fn select_all_columns(&mut self, _window: &mut Window, cx: &mut App) {
         self.column_list.update(cx, |list, cx| {
             list.delegate_mut().select_all();
@@ -499,6 +503,10 @@ impl DataExportView {
 
         self.is_running.update(cx, |r, cx| {
             *r = true;
+            cx.notify();
+        });
+        self.is_finished.update(cx, |f, cx| {
+            *f = false;
             cx.notify();
         });
 
@@ -594,15 +602,14 @@ impl DataExportView {
             let global_state_clone = global_state.clone();
             let connection_id_clone = connection_id.clone();
 
-            let export_handle = cx.background_spawn(async move {
-                global_state_clone
-                    .export_data_with_progress_sync(
-                        connection_id_clone,
-                        export_config,
-                        Some(progress_tx),
-                    )
-                    .await
-            });
+            let export_handle = global_state_clone.export_data_with_progress(
+                cx,
+                db::ExportProgressRequest {
+                    connection_id: connection_id_clone,
+                    config: export_config,
+                    progress_tx: Some(progress_tx),
+                },
+            );
 
             let file_path_for_write = full_path.clone();
             let mut file_created = false;
@@ -1323,7 +1330,7 @@ impl Render for DataExportView {
                                 }))
                         )
                     })
-                    .when(current_step == ExportStep::Execute && !is_running && !is_finished, |this| {
+                    .when(Self::should_show_start_button(current_step, is_running), |this| {
                         this.child(
                             Button::new("start")
                                 .primary()
@@ -1352,10 +1359,31 @@ impl Render for DataExportView {
                     }),
             );
 
-        v_flex()
-            .w_full()
-            .h(px(600.0))
-            .child(TitleBar::new())
-            .child(content)
+        v_flex().w_full().h(px(600.0)).child(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_button_is_visible_on_execute_step_after_export_finishes() {
+        assert!(DataExportView::should_show_start_button(
+            ExportStep::Execute,
+            false
+        ));
+    }
+
+    #[test]
+    fn start_button_is_hidden_while_export_is_running_or_not_ready() {
+        assert!(!DataExportView::should_show_start_button(
+            ExportStep::Execute,
+            true
+        ));
+        assert!(!DataExportView::should_show_start_button(
+            ExportStep::Config,
+            false
+        ));
     }
 }

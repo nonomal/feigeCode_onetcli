@@ -151,39 +151,24 @@ pub trait CloudApiClient: Send + Sync {
     async fn delete_sync_data(&self, id: &str) -> Result<(), CloudApiError>;
 
     // ========================================================================
-    // 团队管理
+    // 团队读取
     // ========================================================================
 
     /// 获取当前用户所在的所有团队
     async fn list_teams(&self) -> Result<Vec<Team>, CloudApiError>;
 
-    /// 创建团队
-    async fn create_team(&self, team: &Team) -> Result<Team, CloudApiError>;
-
-    /// 更新团队信息
-    async fn update_team(&self, team: &Team) -> Result<Team, CloudApiError>;
-
-    /// 删除团队
-    async fn delete_team(&self, id: &str) -> Result<(), CloudApiError>;
-
     /// 获取团队成员列表
     async fn list_team_members(&self, team_id: &str) -> Result<Vec<TeamMember>, CloudApiError>;
 
-    /// 添加团队成员
-    async fn add_team_member(&self, member: &TeamMember) -> Result<TeamMember, CloudApiError>;
+    /// 初始化尚未设置验证数据的团队密钥。
+    async fn initialize_team_key(&self, team: &Team) -> Result<Team, CloudApiError>;
 
-    /// 通过邮箱添加团队成员
-    ///
-    /// 使用服务端 RPC 函数根据邮箱查找用户并添加为团队成员。
-    /// 解决了客户端无法直接访问 auth.users 表的问题。
-    async fn add_team_member_by_email(
+    /// 原子更新团队密钥验证数据并批量重写该团队同步数据。
+    async fn rotate_team_key(
         &self,
-        team_id: &str,
-        email: &str,
-    ) -> Result<TeamMember, CloudApiError>;
-
-    /// 移除团队成员
-    async fn remove_team_member(&self, member_id: &str) -> Result<(), CloudApiError>;
+        team: &Team,
+        records: &[CloudSyncData],
+    ) -> Result<(), CloudApiError>;
 
     // ========================================================================
     // AI 聊天

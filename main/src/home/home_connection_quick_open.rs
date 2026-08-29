@@ -1,13 +1,18 @@
+use crate::external_driver_display::external_driver_icon_for_config_with_registry;
 use crate::home_tab::HomePage;
-use gpui::{App, Context, Entity, ParentElement, SharedString, Styled, Task, Window, div, px};
+use db::ipc::IpcDriverRegistry;
+use gpui::{
+    App, Context, Entity, FontWeight, ParentElement, SharedString, Styled, Task, Window, div, px,
+};
 use gpui_component::{
-    ActiveTheme, IndexPath, WindowExt, h_flex,
+    ActiveTheme, Icon, IndexPath, Sizable, Size, WindowExt, h_flex,
     list::{ListDelegate, ListItem, ListState},
 };
-use one_core::storage::StoredConnection;
+use one_core::storage::{ConnectionType, StoredConnection};
 
 pub(crate) struct ConnectionQuickOpenDelegate {
     parent: Entity<HomePage>,
+    external_driver_registry: IpcDriverRegistry,
     items: Vec<StoredConnection>,
     filtered_items: Vec<StoredConnection>,
     selected_index: Option<IndexPath>,
@@ -15,9 +20,13 @@ pub(crate) struct ConnectionQuickOpenDelegate {
 }
 
 impl ConnectionQuickOpenDelegate {
-    pub(crate) fn new(parent: Entity<HomePage>) -> Self {
+    pub(crate) fn new(
+        parent: Entity<HomePage>,
+        external_driver_registry: IpcDriverRegistry,
+    ) -> Self {
         Self {
             parent,
+            external_driver_registry,
             items: Vec::new(),
             filtered_items: Vec::new(),
             selected_index: None,
@@ -45,6 +54,22 @@ impl ConnectionQuickOpenDelegate {
             })
             .cloned()
             .collect();
+    }
+}
+
+fn connection_icon(connection: &StoredConnection, registry: &IpcDriverRegistry) -> Icon {
+    match connection.connection_type {
+        ConnectionType::Database => connection
+            .to_db_connection()
+            .map(|config| {
+                external_driver_icon_for_config_with_registry(&config, Size::Small, registry)
+                    .unwrap_or_else(|| config.database_type.as_icon())
+            })
+            .unwrap_or_else(|_| Icon::new(ConnectionType::Database.icon()).color())
+            .with_size(Size::Small),
+        _ => Icon::new(connection.connection_type.icon())
+            .color()
+            .with_size(Size::Small),
     }
 }
 
@@ -77,12 +102,14 @@ impl ListDelegate for ConnectionQuickOpenDelegate {
         let parent = self.parent.clone();
         let name = connection.name.clone();
         let connection_type = connection.connection_type;
+        let icon = connection_icon(&connection, &self.external_driver_registry);
         let connection_for_open = connection.clone();
 
         Some(
             ListItem::new(ix)
+                .mx_2()
+                .h(px(44.0))
                 .px_3()
-                .py_2()
                 .rounded(px(6.0))
                 .on_click(move |_, window, cx| {
                     parent.update(cx, |this, cx| {
@@ -94,12 +121,14 @@ impl ListDelegate for ConnectionQuickOpenDelegate {
                     h_flex()
                         .w_full()
                         .items_center()
-                        .gap_2()
+                        .gap_3()
+                        .child(div().flex_shrink_0().flex().items_center().child(icon))
                         .child(
                             div()
                                 .flex_1()
                                 .min_w_0()
                                 .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
                                 .text_ellipsis()
                                 .whitespace_nowrap()
                                 .child(SharedString::from(name)),

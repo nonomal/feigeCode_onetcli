@@ -1,6 +1,12 @@
+use crate::database_table_columns::{
+    render_table_column_resize_handle, resize_table_column, ui_columns_from_object_columns,
+};
 use crate::database_view_plugin::{ToolbarButtonType, build_toolbar_buttons_for};
 use crate::db_tree_view::get_icon_for_node_type;
-use db::{DbNode, DbNodeType, GlobalDbState, ObjectView};
+use crate::search_shortcut::{
+    DB_SEARCH_CONTEXT, FocusSearchInput, OpenSelectedTableQuery, focus_search_input,
+};
+use db::{DbNode, DbNodeType, GlobalDbState, ObjectView, ObjectViewColumn};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
@@ -132,6 +138,33 @@ pub struct DatabaseObjects {
 }
 
 impl DatabaseObjects {
+    fn on_action_focus_search(
+        &mut self,
+        _: &FocusSearchInput,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        focus_search_input(&self.search_input, window, cx);
+    }
+
+    fn on_action_open_selected_table_query(
+        &mut self,
+        _: &OpenSelectedTableQuery,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let nodes = self.build_nodes_for_selected_rows();
+        if nodes.len() != 1 {
+            window.push_notification(Notification::warning(t!("Common.select_row")), cx);
+            return;
+        }
+
+        let node = nodes[0].clone();
+        if matches!(node.node_type, DbNodeType::Table | DbNodeType::View) {
+            cx.emit(DatabaseObjectsEvent::CreateNewQuery { node });
+        }
+    }
+
     pub fn new(workspace: Option<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let loaded_data = cx.new(|_| ObjectView::default());
         let focus_handle = cx.focus_handle();
@@ -180,9 +213,9 @@ impl DatabaseObjects {
         cx.spawn(async move |entity: WeakEntity<Self>, cx: &mut AsyncApp| {
             let result = Self::load_connection_list_view(storage_manager, clone_workspace);
             if let Some(view) = result {
-                let columns = view.columns.clone();
+                let columns = ui_columns_from_object_columns(&view.columns);
                 let rows = view.rows.clone();
-                let db_node_type = view.db_node_type.clone();
+                let db_node_type = view.db_node_type;
                 entity
                     .update(cx, move |this, cx| {
                         this.loaded_data.update(cx, |data, _cx| {
@@ -223,15 +256,23 @@ impl DatabaseObjects {
             return;
         };
 
-        let event = match node.node_type {
-            DbNodeType::Table => DatabaseObjectsEvent::OpenTableData { node },
-            DbNodeType::View => DatabaseObjectsEvent::OpenViewData { node },
-            DbNodeType::NamedQuery => DatabaseObjectsEvent::OpenNamedQuery { node },
-            DbNodeType::Database => DatabaseObjectsEvent::AddDatabaseToTree { node },
-            _ => return,
+        let Some(event) = Self::event_for_double_click_node(node) else {
+            return;
         };
 
         cx.emit(event);
+    }
+
+    fn event_for_double_click_node(node: DbNode) -> Option<DatabaseObjectsEvent> {
+        Some(match node.node_type {
+            DbNodeType::Table => DatabaseObjectsEvent::OpenTableData { node },
+            DbNodeType::View => DatabaseObjectsEvent::OpenViewData { node },
+            DbNodeType::NamedQuery => DatabaseObjectsEvent::OpenNamedQuery { node },
+            DbNodeType::Database | DbNodeType::Schema => {
+                DatabaseObjectsEvent::AddDatabaseToTree { node }
+            }
+            _ => return None,
+        })
     }
 
     pub fn handle_node_selected(
@@ -281,9 +322,9 @@ impl DatabaseObjects {
                 };
 
             if let Some(view) = result {
-                let columns = view.columns.clone();
+                let columns = ui_columns_from_object_columns(&view.columns);
                 let rows = view.rows.clone();
-                let db_node_type = view.db_node_type.clone();
+                let db_node_type = view.db_node_type;
                 entity
                     .update(cx, move |this, cx| {
                         let search_query = this.search_query.clone();
@@ -365,7 +406,7 @@ impl DatabaseObjects {
                 vec![
                     stored_conn.name.clone(),
                     connection_id,
-                    db_type.as_str().into(),
+                    db_type.storage_key(),
                     created,
                     updated,
                     remark,
@@ -376,12 +417,12 @@ impl DatabaseObjects {
         Some(ObjectView {
             db_node_type: DbNodeType::Connection,
             columns: vec![
-                Column::new("name", t!("ConnectionForm.connection_name")).width(200.0),
-                Column::new("id", "ID").width(80.0),
-                Column::new("type", t!("Common.type")),
-                Column::new("created_at", t!("Table.created_at")).width(200.0),
-                Column::new("updated_at", t!("Table.updated_at")).width(200.0),
-                Column::new("remark", t!("ConnectionForm.remark")).width(250.0),
+                ObjectViewColumn::new("name", t!("ConnectionForm.connection_name")).width(200.0),
+                ObjectViewColumn::new("id", "ID").width(80.0),
+                ObjectViewColumn::new("type", t!("Common.type")),
+                ObjectViewColumn::new("created_at", t!("Table.created_at")).width(200.0),
+                ObjectViewColumn::new("updated_at", t!("Table.updated_at")).width(200.0),
+                ObjectViewColumn::new("remark", t!("ConnectionForm.remark")).width(250.0),
             ],
             rows,
             title: t!("Connection.connection_list").to_string(),
@@ -392,7 +433,7 @@ impl DatabaseObjects {
         use std::time::UNIX_EPOCH;
 
         let database_name = node.get_database_name().unwrap_or_default();
-        let database_type = node.database_type.as_str();
+        let database_type = node.database_type.path_key();
         let connection_id = node.connection_id.clone();
 
         let queries_dir = get_queries_dir().ok()?;
@@ -405,9 +446,9 @@ impl DatabaseObjects {
             return Some(ObjectView {
                 db_node_type: DbNodeType::NamedQuery,
                 columns: vec![
-                    Column::new("name", t!("Query.query_name")).width(200.0),
-                    Column::new("created_at", t!("Table.created_at")).width(180.0),
-                    Column::new("updated_at", t!("Table.updated_at")).width(180.0),
+                    ObjectViewColumn::new("name", t!("Query.query_name")).width(200.0),
+                    ObjectViewColumn::new("created_at", t!("Table.created_at")).width(180.0),
+                    ObjectViewColumn::new("updated_at", t!("Table.updated_at")).width(180.0),
                 ],
                 rows: vec![],
                 title: t!("Query.query_list").to_string(),
@@ -453,9 +494,9 @@ impl DatabaseObjects {
         Some(ObjectView {
             db_node_type: DbNodeType::NamedQuery,
             columns: vec![
-                Column::new("name", t!("Query.query_name")).width(200.0),
-                Column::new("created_at", t!("Table.created_at")).width(180.0),
-                Column::new("updated_at", t!("Table.updated_at")).width(180.0),
+                ObjectViewColumn::new("name", t!("Query.query_name")).width(200.0),
+                ObjectViewColumn::new("created_at", t!("Table.created_at")).width(180.0),
+                ObjectViewColumn::new("updated_at", t!("Table.updated_at")).width(180.0),
             ],
             rows,
             title: t!("Query.query_list").to_string(),
@@ -463,17 +504,26 @@ impl DatabaseObjects {
     }
 
     fn build_node_for_row(&self, row_ix: usize) -> Option<DbNode> {
-        let db_node_type = self.db_node_type.clone();
-
+        let db_node_type = self.db_node_type;
         let original_row = self.filtered_rows.get(row_ix).copied()?;
         let row_data = self.rows.get(original_row)?;
+
+        Self::build_node_from_object_row(db_node_type, self.current_node.as_ref(), row_data)
+    }
+
+    fn build_node_from_object_row(
+        db_node_type: DbNodeType,
+        current_node: Option<&DbNode>,
+        row_data: &[String],
+    ) -> Option<DbNode> {
         let name = row_data.first().cloned()?;
 
         // 特殊处理：当 current_node 为 None 且显示连接列表时
-        if self.current_node.is_none() && db_node_type == DbNodeType::Connection {
+        if current_node.is_none() && db_node_type == DbNodeType::Connection {
             let connection_id = row_data.get(1).cloned().unwrap_or_default();
             let db_type_str = row_data.get(2).cloned().unwrap_or_default();
-            let database_type = DatabaseType::from_str(&db_type_str).unwrap_or(DatabaseType::MySQL);
+            let database_type =
+                DatabaseType::from_storage_key(&db_type_str).unwrap_or(DatabaseType::MySQL);
 
             return Some(DbNode::new(
                 connection_id.clone(),
@@ -484,9 +534,9 @@ impl DatabaseObjects {
             ));
         }
 
-        let current_node = self.current_node.as_ref()?;
+        let current_node = current_node?;
         let connection_id = current_node.connection_id.clone();
-        let database_type = current_node.database_type;
+        let database_type = current_node.database_type.clone();
 
         let mut metadata: HashMap<String, String> = current_node.metadata.clone();
         let database = metadata.get("database").cloned().unwrap_or_default();
@@ -501,7 +551,7 @@ impl DatabaseObjects {
                     let row_connection_id = row_data.get(1).cloned().unwrap_or_default();
                     let db_type_str = row_data.get(2).cloned().unwrap_or_default();
                     let row_database_type =
-                        DatabaseType::from_str(&db_type_str).unwrap_or(DatabaseType::MySQL);
+                        DatabaseType::from_storage_key(&db_type_str).unwrap_or(DatabaseType::MySQL);
                     return Some(DbNode::new(
                         row_connection_id.clone(),
                         name,
@@ -535,17 +585,37 @@ impl DatabaseObjects {
                 } else {
                     database.clone()
                 };
+                let schema = current_node.get_schema_name();
                 metadata.insert("database".to_string(), db.clone());
+                if let Some(schema) = schema.as_ref().filter(|schema| !schema.trim().is_empty()) {
+                    metadata.insert("schema".to_string(), schema.clone());
+                }
                 metadata.insert("table".to_string(), name.clone());
-                (
-                    format!("{}:{}:table_folder:{}", connection_id, db, name),
-                    DbNodeType::Table,
-                )
+                let node_id = if let Some(schema) =
+                    schema.as_ref().filter(|schema| !schema.trim().is_empty())
+                {
+                    format!("{}:{}:{}:table_folder:{}", connection_id, db, schema, name)
+                } else {
+                    format!("{}:{}:table_folder:{}", connection_id, db, name)
+                };
+                (node_id, DbNodeType::Table)
             }
             DbNodeType::Schema => {
                 if current_node.node_type == DbNodeType::Connection {
                     metadata.insert("schema".to_string(), name.clone());
                     (format!("{}:{}", connection_id, name), DbNodeType::Schema)
+                } else if current_node.node_type == DbNodeType::Database {
+                    let db = if database.is_empty() {
+                        current_node.name.clone()
+                    } else {
+                        database.clone()
+                    };
+                    metadata.insert("database".to_string(), db.clone());
+                    metadata.insert("schema".to_string(), name.clone());
+                    (
+                        format!("{}:{}:{}", connection_id, db, name),
+                        DbNodeType::Schema,
+                    )
                 } else {
                     let db = metadata
                         .get("database")
@@ -567,12 +637,20 @@ impl DatabaseObjects {
                 } else {
                     database.clone()
                 };
+                let schema = current_node.get_schema_name();
                 metadata.insert("database".to_string(), db.clone());
+                if let Some(schema) = schema.as_ref().filter(|schema| !schema.trim().is_empty()) {
+                    metadata.insert("schema".to_string(), schema.clone());
+                }
                 metadata.insert("view".to_string(), name.clone());
-                (
-                    format!("{}:{}:views_folder:{}", connection_id, db, name),
-                    DbNodeType::View,
-                )
+                let node_id = if let Some(schema) =
+                    schema.as_ref().filter(|schema| !schema.trim().is_empty())
+                {
+                    format!("{}:{}:{}:views_folder:{}", connection_id, db, schema, name)
+                } else {
+                    format!("{}:{}:views_folder:{}", connection_id, db, name)
+                };
+                (node_id, DbNodeType::View)
             }
             DbNodeType::QueriesFolder | DbNodeType::NamedQuery => {
                 let query_id = row_data.get(1).cloned().unwrap_or_default();
@@ -644,9 +722,10 @@ impl DatabaseObjects {
         &self,
         columns: &[Column],
         show_row_number: bool,
-        cx: &App,
-    ) -> impl IntoElement {
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let mut header = h_flex()
+            .w_full()
             .h(px(32.))
             .px_2()
             .items_center()
@@ -673,13 +752,11 @@ impl DatabaseObjects {
             );
         }
 
-        let is_last_column = columns.len();
         for (col_ix, column) in columns.iter().enumerate() {
-            let is_last = col_ix == is_last_column - 1;
             header = header.child(
                 div()
-                    .when(!is_last, |el| el.w(column.width))
-                    .when(is_last, |el| el.flex_1())
+                    .relative()
+                    .w(column.width)
                     .h_full()
                     .px_2()
                     .text_sm()
@@ -690,51 +767,61 @@ impl DatabaseObjects {
                             .flex()
                             .items_center()
                             .child(column.name.clone()),
-                    ),
+                    )
+                    .child(self.render_column_resize_handle(col_ix, column, cx)),
             );
         }
 
-        header
+        header.into_any_element()
     }
 
-    fn render_row(
+    fn render_column_resize_handle(
         &self,
-        row_ix: usize,
-        row_values: &[String],
-        columns: &[Column],
-        show_row_number: bool,
-        is_selected: bool,
-        search_query: &str,
-        db_node_type: DbNodeType,
-        cx: &App,
-    ) -> impl IntoElement {
+        col_ix: usize,
+        column: &Column,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        render_table_column_resize_handle(
+            "database-object-column-resize",
+            "database-object-column-resize",
+            col_ix,
+            column,
+            cx,
+            |this: &Self, col_ix| this.columns.get(col_ix).map(|column| column.width),
+            |this: &mut Self, col_ix, width| {
+                resize_table_column(&mut this.columns, col_ix, width);
+            },
+        )
+    }
+
+    fn render_row(&self, args: ObjectRowRenderArgs<'_>, cx: &App) -> impl IntoElement {
         let mut row = h_flex()
-            .h(px(44.))
+            .w_full()
+            .h(one_ui::table_row_height(cx))
             .px_2()
             .items_center()
-            .when(is_selected, |el| el.bg(cx.theme().selection));
+            .when(args.is_selected, |el| el.bg(cx.theme().selection));
 
-        if show_row_number {
+        if args.show_row_number {
             row = row.child(
                 div()
                     .w(px(48.))
                     .px_2()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child((row_ix + 1).to_string()),
+                    .child((args.row_ix + 1).to_string()),
             );
         }
 
-        let is_last_column = columns.len();
-        for (col_ix, column) in columns.iter().enumerate() {
-            let cell_value = row_values.get(col_ix).cloned().unwrap_or_default();
+        for (col_ix, column) in args.columns.iter().enumerate() {
+            let cell_value = args.row_values.get(col_ix).cloned().unwrap_or_default();
             let tooltip_text = cell_value.clone();
             let cell = if col_ix == 0 {
-                let icon = get_icon_for_node_type(&db_node_type, cx.theme()).color();
-                let label = if search_query.is_empty() {
+                let icon = get_icon_for_node_type(&args.db_node_type, cx.theme()).color();
+                let label = if args.search_query.is_empty() {
                     Label::new(cell_value)
                 } else {
-                    Label::new(cell_value).highlights(search_query.to_string())
+                    Label::new(cell_value).highlights(args.search_query.to_string())
                 };
                 h_flex()
                     .gap_2()
@@ -746,14 +833,11 @@ impl DatabaseObjects {
                 div().child(cell_value).into_any_element()
             };
 
-            // 最后一列使用 flex_1 自动填充剩余空间，其他列使用固定宽度
-            let is_last = col_ix == is_last_column - 1;
-            let cell_id = SharedString::from(format!("cell-{}-{}", row_ix, col_ix));
+            let cell_id = SharedString::from(format!("cell-{}-{}", args.row_ix, col_ix));
             row = row.child(
                 div()
                     .id(cell_id)
-                    .when(!is_last, |el| el.w(column.width))
-                    .when(is_last, |el| el.flex_1())
+                    .w(column.width)
                     .px_2()
                     .overflow_hidden()
                     .text_ellipsis()
@@ -780,11 +864,11 @@ impl DatabaseObjects {
         let data_db_node_type = self.db_node_type;
         let node_type = current_node
             .as_ref()
-            .map(|n| n.node_type.clone())
+            .map(|n| n.node_type)
             .unwrap_or(DbNodeType::Connection);
         let database_type = current_node
             .as_ref()
-            .map(|n| n.database_type)
+            .map(|n| n.database_type.clone())
             .unwrap_or(DatabaseType::MySQL);
 
         buttons.push({
@@ -875,6 +959,16 @@ impl DatabaseObjects {
     }
 }
 
+struct ObjectRowRenderArgs<'a> {
+    row_ix: usize,
+    row_values: &'a [String],
+    columns: &'a [Column],
+    show_row_number: bool,
+    is_selected: bool,
+    search_query: &'a str,
+    db_node_type: DbNodeType,
+}
+
 impl Render for DatabaseObjects {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let loaded_data = self.loaded_data.read(cx);
@@ -890,6 +984,10 @@ impl Render for DatabaseObjects {
 
         v_flex()
             .size_full()
+            .track_focus(&self.focus_handle)
+            .key_context(DB_SEARCH_CONTEXT)
+            .on_action(cx.listener(Self::on_action_focus_search))
+            .on_action(cx.listener(Self::on_action_open_selected_table_query))
             .child(
                 h_flex()
                     .gap_1()
@@ -921,7 +1019,7 @@ impl Render for DatabaseObjects {
                         uniform_list("database-objects-list", row_count, {
                             cx.processor(
                                 move |state: &mut Self, range: Range<usize>, _window, cx| {
-                                    let db_node_type = state.db_node_type.clone();
+                                    let db_node_type = state.db_node_type;
                                     let show_row_number = true;
                                     range
                                         .map(|list_ix| {
@@ -966,13 +1064,15 @@ impl Render for DatabaseObjects {
                                                         },
                                                     ))
                                                     .child(state.render_row(
-                                                        row_ix,
-                                                        row_values,
-                                                        &list_columns,
-                                                        show_row_number,
-                                                        is_selected,
-                                                        &list_search_query,
-                                                        db_node_type.clone(),
+                                                        ObjectRowRenderArgs {
+                                                            row_ix,
+                                                            row_values,
+                                                            columns: &list_columns,
+                                                            show_row_number,
+                                                            is_selected,
+                                                            search_query: &list_search_query,
+                                                            db_node_type,
+                                                        },
                                                         cx,
                                                     ))
                                                     .into_any_element()
@@ -981,7 +1081,7 @@ impl Render for DatabaseObjects {
                                 },
                             )
                         })
-                        .flex_grow()
+                        .flex_grow(1.0)
                         .size_full()
                         .with_sizing_behavior(ListSizingBehavior::Auto),
                     ),
@@ -998,7 +1098,7 @@ impl Clone for DatabaseObjects {
             columns: self.columns.clone(),
             rows: self.rows.clone(),
             filtered_rows: self.filtered_rows.clone(),
-            db_node_type: self.db_node_type.clone(),
+            db_node_type: self.db_node_type,
             focus_handle: self.focus_handle.clone(),
             workspace: self.workspace.clone(),
             search_input: self.search_input.clone(),
@@ -1082,6 +1182,135 @@ impl TabContent for DatabaseObjectsPanel {
 
     fn width_size(&self, _cx: &App) -> Option<Size> {
         Some(Size::XSmall)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn database_node() -> DbNode {
+        let mut metadata = HashMap::new();
+        metadata.insert("database".to_string(), "app_db".to_string());
+        DbNode::new(
+            "conn1:app_db",
+            "app_db",
+            DbNodeType::Database,
+            "conn1".to_string(),
+            DatabaseType::PostgreSQL,
+        )
+        .with_metadata(metadata)
+    }
+
+    fn schema_node() -> DbNode {
+        let mut metadata = HashMap::new();
+        metadata.insert("database".to_string(), "app_db".to_string());
+        metadata.insert("schema".to_string(), "public".to_string());
+        DbNode::new(
+            "conn1:app_db:public",
+            "public",
+            DbNodeType::Schema,
+            "conn1".to_string(),
+            DatabaseType::PostgreSQL,
+        )
+        .with_metadata(metadata)
+    }
+
+    #[test]
+    fn database_object_schema_row_builds_schema_node() {
+        let row = vec![
+            "public".to_string(),
+            "owner".to_string(),
+            "3".to_string(),
+            String::new(),
+        ];
+
+        let node = DatabaseObjects::build_node_from_object_row(
+            DbNodeType::Schema,
+            Some(&database_node()),
+            &row,
+        )
+        .expect("schema row should produce a node");
+
+        assert_eq!(DbNodeType::Schema, node.node_type);
+        assert_eq!("public", node.name);
+        assert_eq!(
+            Some("app_db"),
+            node.metadata.get("database").map(String::as_str)
+        );
+        assert_eq!(
+            Some("public"),
+            node.metadata.get("schema").map(String::as_str)
+        );
+        assert_eq!("conn1:app_db:public", node.id);
+    }
+
+    #[test]
+    fn schema_object_table_row_builds_table_node() {
+        let row = vec!["users".to_string()];
+
+        let node = DatabaseObjects::build_node_from_object_row(
+            DbNodeType::Table,
+            Some(&schema_node()),
+            &row,
+        )
+        .expect("table row under schema should produce a node");
+
+        assert_eq!(DbNodeType::Table, node.node_type);
+        assert_eq!("users", node.name);
+        assert_eq!(
+            Some("app_db"),
+            node.metadata.get("database").map(String::as_str)
+        );
+        assert_eq!(
+            Some("public"),
+            node.metadata.get("schema").map(String::as_str)
+        );
+        assert_eq!(
+            Some("users"),
+            node.metadata.get("table").map(String::as_str)
+        );
+        assert_eq!("conn1:app_db:public:table_folder:users", node.id);
+    }
+
+    #[test]
+    fn schema_object_view_row_builds_view_node() {
+        let row = vec!["active_users".to_string()];
+
+        let node = DatabaseObjects::build_node_from_object_row(
+            DbNodeType::View,
+            Some(&schema_node()),
+            &row,
+        )
+        .expect("view row under schema should produce a node");
+
+        assert_eq!(DbNodeType::View, node.node_type);
+        assert_eq!("active_users", node.name);
+        assert_eq!(
+            Some("app_db"),
+            node.metadata.get("database").map(String::as_str)
+        );
+        assert_eq!(
+            Some("public"),
+            node.metadata.get("schema").map(String::as_str)
+        );
+        assert_eq!(
+            Some("active_users"),
+            node.metadata.get("view").map(String::as_str)
+        );
+        assert_eq!("conn1:app_db:public:views_folder:active_users", node.id);
+    }
+
+    #[test]
+    fn schema_double_click_adds_node_to_tree() {
+        let event = DatabaseObjects::event_for_double_click_node(schema_node())
+            .expect("schema double click should emit an event");
+
+        assert!(matches!(
+            event,
+            DatabaseObjectsEvent::AddDatabaseToTree { node }
+                if node.node_type == DbNodeType::Schema && node.name == "public"
+        ));
     }
 }
 

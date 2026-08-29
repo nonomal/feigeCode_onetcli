@@ -1,18 +1,19 @@
 use gpui::{
     AnyElement, App, AppContext, Bounds, ClickEvent, Context, DismissEvent, Edges, ElementId,
-    Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding,
-    Length, ParentElement, Pixels, Render, RenderOnce, SharedString, StatefulInteractiveElement,
-    StyleRefinement, Styled, Subscription, Task, WeakEntity, Window, anchored, deferred, div,
-    prelude::FluentBuilder, px, rems,
+    Entity, EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement,
+    KeyBinding, Length, ParentElement, Pixels, Render, RenderOnce, SharedString,
+    StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, WeakEntity, Window,
+    anchored, deferred, div, prelude::FluentBuilder, px, rems,
 };
 use rust_i18n::t;
 
 use crate::{
-    ActiveTheme, Disableable, ElementExt as _, Icon, IconName, IndexPath, Selectable, Sizable,
-    Size, StyleSized, StyledExt,
+    ActiveTheme, Colorize as _, Disableable, ElementExt as _, Icon, IconName, IndexPath,
+    Selectable, Sizable, Size, StyleSized, StyledExt,
     actions::{Cancel, Confirm, SelectDown, SelectUp},
+    global_state::GlobalState,
     h_flex,
-    input::{clear_button, input_style},
+    input::{LocalInputStyle, clear_button, input_style},
     list::{List, ListDelegate, ListState},
     v_flex,
 };
@@ -198,15 +199,16 @@ where
         let selected = self
             .selected_index
             .map_or(false, |selected_index| selected_index == ix);
-        let size = self
-            .state
-            .upgrade()
-            .map_or(Size::Medium, |state| state.read(cx).options.size);
+        let (size, menu_item_style) = self.state.upgrade().map_or((Size::Medium, None), |state| {
+            let options = &state.read(cx).options;
+            (options.size, options.menu_item_style())
+        });
 
         if let Some(item) = self.delegate.item(ix) {
             let list_item = SelectListItem::new(ix.row)
                 .selected(selected)
                 .with_size(size)
+                .menu_item_style(menu_item_style)
                 .child(div().whitespace_nowrap().child(item.render(window, cx)));
             Some(list_item)
         } else {
@@ -235,7 +237,7 @@ where
             }
 
             _ = state.update(cx, |this, cx| {
-                this.open = false;
+                this.set_open(false, cx);
                 this.focus(window, cx);
             });
         });
@@ -253,7 +255,7 @@ where
                 cx.emit(SelectEvent::Confirm(selected_value.clone()));
                 this.final_selected_index = selected_index;
                 this.selected_value = selected_value;
-                this.open = false;
+                this.set_open(false, cx);
                 this.focus(window, cx);
             });
         });
@@ -316,8 +318,11 @@ struct SelectOptions {
     search_placeholder: Option<SharedString>,
     empty: Option<AnyElement>,
     menu_width: Length,
+    menu_max_h: Length,
     disabled: bool,
     appearance: bool,
+    local_style: Option<LocalInputStyle>,
+    menu_item_style: Option<SelectMenuItemStyle>,
 }
 
 impl Default for SelectOptions {
@@ -331,10 +336,47 @@ impl Default for SelectOptions {
             title_prefix: None,
             empty: None,
             menu_width: Length::Auto,
+            menu_max_h: rems(20.).into(),
             disabled: false,
             appearance: true,
             search_placeholder: None,
+            local_style: None,
+            menu_item_style: None,
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SelectMenuItemStyle {
+    foreground: Hsla,
+    hover_background: Hsla,
+    selected_background: Hsla,
+    selected_foreground: Hsla,
+    selected_border: Option<Hsla>,
+}
+
+impl SelectOptions {
+    fn menu_item_style(&self) -> Option<SelectMenuItemStyle> {
+        self.menu_item_style.or_else(|| {
+            self.local_style.map(|style| SelectMenuItemStyle {
+                foreground: style.foreground,
+                hover_background: style.background.mix_oklab(style.foreground, 0.08),
+                selected_background: style.background.mix_oklab(style.foreground, 0.14),
+                selected_foreground: style.foreground,
+                selected_border: Some(style.border),
+            })
+        })
+    }
+
+    fn menu_container_style(&self, cx: &App) -> (Hsla, Hsla, Hsla) {
+        self.local_style.filter(|_| !self.disabled).map_or(
+            (
+                cx.theme().popover,
+                cx.theme().popover_foreground,
+                cx.theme().border,
+            ),
+            |style| (style.background, style.foreground, style.border),
+        )
     }
 }
 
@@ -603,6 +645,7 @@ where
         });
         self.final_selected_index = selected_index;
         self.update_selected_value(window, cx);
+        cx.notify();
     }
 
     /// Set selected value for the select.
@@ -670,13 +713,13 @@ where
             });
         }
 
-        self.open = false;
+        self.set_open(false, cx);
         cx.notify();
     }
 
     fn up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
         if !self.open {
-            self.open = true;
+            self.set_open(true, cx);
         }
 
         self.list.focus_handle(cx).focus(window, cx);
@@ -685,7 +728,7 @@ where
 
     fn down(&mut self, _: &SelectDown, window: &mut Window, cx: &mut Context<Self>) {
         if !self.open {
-            self.open = true;
+            self.set_open(true, cx);
         }
 
         self.list.focus_handle(cx).focus(window, cx);
@@ -697,7 +740,7 @@ where
         cx.propagate();
 
         if !self.open {
-            self.open = true;
+            self.set_open(true, cx);
             cx.notify();
         }
 
@@ -707,19 +750,32 @@ where
     fn toggle_menu(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
 
-        self.open = !self.open;
+        self.set_open(!self.open, cx);
         if self.open {
             self.list.focus_handle(cx).focus(window, cx);
         }
         cx.notify();
     }
 
-    fn escape(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+    fn escape(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         if !self.open {
             cx.propagate();
+            return;
         }
 
-        self.open = false;
+        cx.stop_propagation();
+        self.set_open(false, cx);
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.open = open;
+        if self.open {
+            GlobalState::global_mut(cx).register_deferred_popover(&self.focus_handle)
+        } else {
+            GlobalState::global_mut(cx).unregister_deferred_popover(&self.focus_handle)
+        }
         cx.notify();
     }
 
@@ -731,7 +787,12 @@ where
 
     /// Returns the title element for the select input.
     fn display_title(&mut self, _: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let default_title = div().text_color(cx.theme().muted_foreground).child(
+        let muted_foreground = self
+            .options
+            .local_style
+            .filter(|_| !self.options.disabled)
+            .map_or(cx.theme().muted_foreground, |style| style.muted_foreground);
+        let default_title = div().text_color(muted_foreground).child(
             self.options
                 .placeholder
                 .clone()
@@ -783,7 +844,24 @@ where
         let allow_open = !(self.open || self.options.disabled);
         let outline_visible = self.open || is_focused && !self.options.disabled;
         let popup_radius = cx.theme().radius.min(px(8.));
+
         let (bg, fg) = input_style(self.options.disabled, cx);
+        let (bg, fg, border, muted_foreground) = self.options.local_style.map_or_else(
+            || (bg, fg, cx.theme().input, cx.theme().muted_foreground),
+            |style| {
+                if self.options.disabled {
+                    (bg, fg, cx.theme().input, cx.theme().muted_foreground)
+                } else {
+                    (
+                        style.background,
+                        style.foreground,
+                        style.border,
+                        style.muted_foreground,
+                    )
+                }
+            },
+        );
+        let (menu_bg, menu_fg, menu_border) = self.options.menu_container_style(cx);
 
         self.list
             .update(cx, |list, cx| list.set_searchable(searchable, cx));
@@ -803,10 +881,10 @@ where
                     .when(self.options.appearance, |this| {
                         this.bg(bg)
                             .text_color(fg)
-                            .border_color(cx.theme().input)
+                            .when(self.options.disabled, |this| this.opacity(0.5))
+                            .border_color(border)
                             .rounded(cx.theme().radius)
                             .when(cx.theme().shadow, |this| this.shadow_xs())
-                            .when(self.options.disabled, |this| this.opacity(0.5))
                     })
                     .map(|this| {
                         if self.options.disabled {
@@ -854,7 +932,7 @@ where
                                     None => Icon::new(IconName::ChevronDown),
                                 };
 
-                                this.child(icon.xsmall().text_color(cx.theme().muted_foreground))
+                                this.child(icon.xsmall().text_color(muted_foreground))
                             }),
                     )
                     .on_prepaint({
@@ -876,9 +954,10 @@ where
                                     v_flex()
                                         .occlude()
                                         .mt_1p5()
-                                        .bg(cx.theme().background)
+                                        .bg(menu_bg)
+                                        .text_color(menu_fg)
                                         .border_1()
-                                        .border_color(cx.theme().border)
+                                        .border_color(menu_border)
                                         .rounded(popup_radius)
                                         .shadow_md()
                                         .child(
@@ -890,7 +969,7 @@ where
                                                     },
                                                 )
                                                 .with_size(self.options.size)
-                                                .max_h(rems(20.))
+                                                .max_h(self.options.menu_max_h)
                                                 .paddings(Edges::all(px(4.))),
                                         ),
                                 )
@@ -920,6 +999,12 @@ where
     /// Set the width of the dropdown menu, default: Length::Auto
     pub fn menu_width(mut self, width: impl Into<Length>) -> Self {
         self.options.menu_width = width.into();
+        self
+    }
+
+    /// Set the max height of the dropdown menu, default: 20rem
+    pub fn menu_max_h(mut self, max_h: impl Into<Length>) -> Self {
+        self.options.menu_max_h = max_h.into();
         self
     }
 
@@ -972,6 +1057,30 @@ where
     /// Set the appearance of the select, if false the select input will no border, background.
     pub fn appearance(mut self, appearance: bool) -> Self {
         self.options.appearance = appearance;
+        self
+    }
+
+    /// Override closed-control colors for a locally themed embedded panel.
+    pub fn local_style(mut self, style: LocalInputStyle) -> Self {
+        self.options.local_style = Some(style);
+        self
+    }
+
+    /// Override dropdown item colors for a locally themed embedded panel.
+    pub fn local_menu_item_style(
+        mut self,
+        foreground: Hsla,
+        hover_background: Hsla,
+        selected_background: Hsla,
+        selected_foreground: Hsla,
+    ) -> Self {
+        self.options.menu_item_style = Some(SelectMenuItemStyle {
+            foreground,
+            hover_background,
+            selected_background,
+            selected_foreground,
+            selected_border: None,
+        });
         self
     }
 }
@@ -1044,6 +1153,7 @@ struct SelectListItem {
     style: StyleRefinement,
     selected: bool,
     disabled: bool,
+    menu_item_style: Option<SelectMenuItemStyle>,
     children: Vec<AnyElement>,
 }
 
@@ -1055,8 +1165,14 @@ impl SelectListItem {
             style: StyleRefinement::default(),
             selected: false,
             disabled: false,
+            menu_item_style: None,
             children: Vec::new(),
         }
+    }
+
+    fn menu_item_style(mut self, style: Option<SelectMenuItemStyle>) -> Self {
+        self.menu_item_style = style;
+        self
     }
 }
 
@@ -1099,6 +1215,48 @@ impl Styled for SelectListItem {
 
 impl RenderOnce for SelectListItem {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let selected_background = self.menu_item_style.map_or_else(
+            || {
+                if cx.theme().list.active_highlight {
+                    cx.theme().list_active
+                } else {
+                    cx.theme().accent
+                }
+            },
+            |style| style.selected_background,
+        );
+        let foreground = self.menu_item_style.map_or_else(
+            || {
+                if self.selected && !cx.theme().list.active_highlight {
+                    cx.theme().accent_foreground
+                } else {
+                    cx.theme().foreground
+                }
+            },
+            |style| {
+                if self.selected {
+                    style.selected_foreground
+                } else {
+                    style.foreground
+                }
+            },
+        );
+        let hover_background = self
+            .menu_item_style
+            .map_or(cx.theme().list_hover, |style| style.hover_background);
+        let selected_border = self
+            .menu_item_style
+            .and_then(|style| style.selected_border)
+            .unwrap_or(cx.theme().list_active_border);
+        let show_selected_border = self
+            .menu_item_style
+            .map_or(cx.theme().list.active_highlight, |style| {
+                style.selected_border.is_some()
+            });
+        let corner_radii = self.style.corner_radii.clone();
+        let mut selected_style = StyleRefinement::default();
+        selected_style.corner_radii = corner_radii;
+
         h_flex()
             .id(self.id)
             .relative()
@@ -1107,7 +1265,7 @@ impl RenderOnce for SelectListItem {
             .px_2()
             .rounded(cx.theme().radius)
             .text_base()
-            .text_color(cx.theme().foreground)
+            .text_color(foreground)
             .relative()
             .items_center()
             .justify_between()
@@ -1116,10 +1274,25 @@ impl RenderOnce for SelectListItem {
             .refine_style(&self.style)
             .when(!self.disabled, |this| {
                 this.when(!self.selected, |this| {
-                    this.hover(|this| this.bg(cx.theme().accent.alpha(0.7)))
+                    this.hover(|this| this.bg(hover_background))
                 })
             })
-            .when(self.selected, |this| this.bg(cx.theme().accent))
+            .when(self.selected, |this| {
+                this.bg(selected_background)
+                    .when(show_selected_border, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .border_1()
+                                .border_color(selected_border)
+                                .refine_style(&selected_style),
+                        )
+                    })
+            })
             .when(self.disabled, |this| {
                 this.text_color(cx.theme().muted_foreground)
             })
@@ -1131,5 +1304,66 @@ impl RenderOnce for SelectListItem {
                     .gap_x_1()
                     .child(div().w_full().children(self.children)),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SelectMenuItemStyle, SelectOptions};
+    use crate::input::LocalInputStyle;
+    use gpui::rgb;
+
+    #[test]
+    fn local_style_derives_dropdown_item_colors() {
+        let local = LocalInputStyle {
+            background: rgb(0x111111).into(),
+            foreground: rgb(0xeeeeee).into(),
+            muted_foreground: rgb(0x999999).into(),
+            border: rgb(0x333333).into(),
+        };
+        let options = SelectOptions {
+            local_style: Some(local),
+            ..SelectOptions::default()
+        };
+        let style = options
+            .menu_item_style()
+            .expect("local Select style should apply to dropdown items");
+
+        assert_eq!(local.foreground, style.foreground);
+        assert_eq!(local.foreground, style.selected_foreground);
+        assert_eq!(Some(local.border), style.selected_border);
+        assert_ne!(local.background, style.hover_background);
+        assert_ne!(local.background, style.selected_background);
+    }
+
+    #[test]
+    fn explicit_dropdown_item_style_overrides_derived_local_style() {
+        let local = LocalInputStyle {
+            background: rgb(0x111111).into(),
+            foreground: rgb(0xeeeeee).into(),
+            muted_foreground: rgb(0x999999).into(),
+            border: rgb(0x333333).into(),
+        };
+        let explicit = SelectMenuItemStyle {
+            foreground: rgb(0xfafafa).into(),
+            hover_background: rgb(0x222222).into(),
+            selected_background: rgb(0x005fcc).into(),
+            selected_foreground: rgb(0xffffff).into(),
+            selected_border: None,
+        };
+        let options = SelectOptions {
+            local_style: Some(local),
+            menu_item_style: Some(explicit),
+            ..SelectOptions::default()
+        };
+        let style = options
+            .menu_item_style()
+            .expect("explicit Select menu item style should be present");
+
+        assert_eq!(explicit.foreground, style.foreground);
+        assert_eq!(explicit.hover_background, style.hover_background);
+        assert_eq!(explicit.selected_background, style.selected_background);
+        assert_eq!(explicit.selected_foreground, style.selected_foreground);
+        assert_eq!(explicit.selected_border, style.selected_border);
     }
 }

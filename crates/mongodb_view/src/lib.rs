@@ -11,6 +11,7 @@ rust_i18n::i18n!("locales", fallback = "en");
 
 pub mod collection_view;
 pub mod connection;
+pub mod document_table_delegate;
 pub mod manager;
 pub mod mongo_form_window;
 pub mod mongo_tab;
@@ -22,7 +23,7 @@ pub mod types;
 pub use collection_view::CollectionView;
 pub use connection::{MongoConnection, MongoConnectionImpl};
 pub use manager::{GlobalMongoState, MongoManager};
-pub use mongo_form_window::{MongoFormWindow, MongoFormWindowConfig};
+pub use mongo_form_window::{MongoFormSavedCallback, MongoFormWindow, MongoFormWindowConfig};
 pub use mongo_tab::MongoTabView;
 pub use mongo_tree_view::{MongoTreeView, MongoTreeViewEvent};
 pub use sidebar::{MongoSidebar, MongoSidebarEvent};

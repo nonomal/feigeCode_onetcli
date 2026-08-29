@@ -6,15 +6,20 @@ edition = "2021"
 [dependencies]
 # Terminal core
 terminal = { workspace = true }
+public_mcp = { workspace = true }
 ssh = { workspace = true }
 sftp = { workspace = true }
-remote_file_editor = { workspace = true, features = ["ui"] }
+remote_file_editor = { workspace = true }
+remote_image_preview = { workspace = true }
 
 # GPUI
 gpui = { workspace = true }
 gpui-component = { workspace = true }
+ai_chat_view = { workspace = true }
+agent_runtime = { workspace = true }
 one-core = { workspace = true }
 one-ui = { workspace = true }
+connection-form = { workspace = true }
 # Terminal emulation
 alacritty_terminal.workspace = true
 
@@ -31,3 +36,5 @@ tokio = { workspace = true }
 serialport = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }

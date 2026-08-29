@@ -2,6 +2,7 @@ use crate::DatabasePlugin;
 use crate::executor::{ExecOptions, SqlResult, SqlSource};
 use async_trait::async_trait;
 use one_core::storage::DbConnectionConfig;
+use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -157,6 +158,14 @@ pub trait DbConnection: Sync + Send {
         true
     }
 
+    /// Whether an idle release should close the physical connection.
+    ///
+    /// File-backed engines such as DuckDB hold exclusive file handles, so keeping
+    /// them idle in the shared session pool can block a later open of the file.
+    fn close_on_release(&self) -> bool {
+        false
+    }
+
     async fn connect(&mut self) -> Result<(), DbError>;
     async fn disconnect(&mut self) -> Result<(), DbError>;
     async fn execute(
@@ -167,8 +176,18 @@ pub trait DbConnection: Sync + Send {
     ) -> Result<Vec<SqlResult>, DbError>;
     async fn query(&self, query: &str) -> Result<SqlResult, DbError>;
 
+    fn ping_query(&self) -> &'static str {
+        "SELECT 1"
+    }
+
+    async fn driver_request_value(&self, _method: &str, _params: Value) -> Result<Value, DbError> {
+        Err(DbError::NotSupported(
+            "driver request is not supported by this connection".to_string(),
+        ))
+    }
+
     async fn ping(&self) -> Result<(), DbError> {
-        match self.query("SELECT 1").await? {
+        match self.query(self.ping_query()).await? {
             SqlResult::Error(error) => Err(DbError::connection(format!(
                 "connection ping failed: {}",
                 error.message

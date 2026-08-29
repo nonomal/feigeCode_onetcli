@@ -1,15 +1,16 @@
 use crate::connection::{DbConnection, DbError, StreamingProgress};
 use crate::executor::{
     ExecOptions, ExecResult, QueryColumnMeta, QueryResult, SqlErrorInfo, SqlResult, SqlSource,
+    apply_query_max_rows,
 };
 use crate::ssh_tunnel::resolve_connection_target;
 use crate::{DatabasePlugin, format_message, truncate_str};
 
 use async_trait::async_trait;
 use clickhouse::Client;
+use connection_tunnel::TunnelGuard;
 use one_core::storage::DbConnectionConfig;
 use serde::Deserialize;
-use ssh::LocalPortForwardTunnel;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -19,7 +20,7 @@ use tracing::{debug, error, info};
 pub struct ClickHouseDbConnection {
     config: DbConnectionConfig,
     client: Option<Client>,
-    tunnel: Option<LocalPortForwardTunnel>,
+    tunnel: Option<TunnelGuard>,
 }
 
 impl ClickHouseDbConnection {
@@ -311,7 +312,13 @@ impl DbConnection for ClickHouseDbConnection {
                 idx + 1,
                 statements.len()
             );
-            let result = Self::execute_single(client, sql).await?;
+            let sql_to_execute = apply_query_max_rows(
+                plugin.name(),
+                sql,
+                options.max_rows,
+                plugin.is_query_statement(sql),
+            );
+            let result = Self::execute_single(client, sql_to_execute.as_ref()).await?;
 
             let is_error = result.is_error();
             if is_error {
@@ -438,7 +445,13 @@ impl DbConnection for ClickHouseDbConnection {
                 current += 1;
                 debug!("[ClickHouse] Streaming statement {}", current);
 
-                let result = match Self::execute_single(client, &sql).await {
+                let sql_to_execute = apply_query_max_rows(
+                    plugin.name(),
+                    &sql,
+                    options.max_rows,
+                    plugin.is_query_statement(&sql),
+                );
+                let result = match Self::execute_single(client, sql_to_execute.as_ref()).await {
                     Ok(r) => r,
                     Err(e) => {
                         let sql_preview = if sql.len() > 200 {
@@ -482,7 +495,13 @@ impl DbConnection for ClickHouseDbConnection {
                 let current = index + 1;
                 debug!("[ClickHouse] Streaming statement {}/{}", current, total);
 
-                let result = match Self::execute_single(client, &sql).await {
+                let sql_to_execute = apply_query_max_rows(
+                    plugin.name(),
+                    &sql,
+                    options.max_rows,
+                    plugin.is_query_statement(&sql),
+                );
+                let result = match Self::execute_single(client, sql_to_execute.as_ref()).await {
                     Ok(r) => r,
                     Err(e) => {
                         let sql_preview = if sql.len() > 200 {

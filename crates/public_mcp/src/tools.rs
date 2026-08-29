@@ -1,0 +1,66 @@
+mod agent_runtime_adapter;
+mod internal;
+mod redis;
+mod registry;
+mod remote_ops;
+mod target_adapter;
+mod terminal_control;
+mod terminal_exec;
+mod tool_runtime_adapter;
+
+pub use agent_runtime_adapter::agent_runtime_tool_registry;
+pub use internal::{
+    InternalFunctionDefinition, InternalFunctionFuture, internal_function_tool_registry,
+};
+pub use redis::{
+    RedisCommandExecution, RedisCommandExecutionProvider, RedisConnectionSnapshot,
+    RedisConnectionSnapshotProvider, RedisToolProvider,
+};
+pub use registry::{PublicMcpToolRegistry, PublicMcpToolRegistryError};
+pub use remote_ops::remote_ops_tool_registry;
+pub use terminal_control::terminal_control_tool_registry;
+pub use terminal_exec::terminal_exec_tool_registry;
+pub use tool_runtime_adapter::{ResourcePoolProvider, ToolRuntimeMcpProvider};
+
+use crate::approval::{PublicMcpApprovalManager, PublicMcpApprovalOutcome};
+use crate::permissions::{PermissionMode, PublicMcpOperationKind};
+use rmcp::{
+    ErrorData as McpError,
+    model::{CallToolResult, JsonObject, Tool},
+};
+use serde_json::Value;
+use std::{future::Future, pin::Pin};
+
+pub type PublicMcpToolFuture =
+    Pin<Box<dyn Future<Output = Result<CallToolResult, McpError>> + Send + 'static>>;
+
+#[derive(Clone)]
+pub struct PublicMcpToolContext {
+    pub permission_mode: PermissionMode,
+    pub approver: PublicMcpApprovalManager,
+}
+
+impl PublicMcpToolContext {
+    pub async fn request_approval(
+        &self,
+        operation: PublicMcpOperationKind,
+        tool_name: impl Into<String>,
+        summary: impl Into<String>,
+        details: Value,
+    ) -> PublicMcpApprovalOutcome {
+        self.approver
+            .request(operation, tool_name, summary, details)
+            .await
+    }
+}
+
+pub trait PublicMcpToolProvider: Send + Sync + 'static {
+    fn tools(&self) -> Vec<Tool>;
+
+    fn call_tool(
+        &self,
+        name: &str,
+        arguments: Option<JsonObject>,
+        context: PublicMcpToolContext,
+    ) -> Option<PublicMcpToolFuture>;
+}

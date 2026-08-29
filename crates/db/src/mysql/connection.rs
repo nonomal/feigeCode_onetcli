@@ -13,16 +13,22 @@ use tracing::{debug, error, info};
 use crate::connection::{DbConnection, DbError, StreamingProgress};
 use crate::executor::{
     ExecOptions, ExecResult, QueryColumnMeta, QueryResult, SqlErrorInfo, SqlResult, SqlSource,
+    apply_query_max_rows,
 };
 use crate::rustls_provider::ensure_rustls_crypto_provider;
-use crate::ssh_tunnel::resolve_connection_target;
+use crate::ssh_tunnel::{resolve_connection_target, resolve_tunnel_destination};
 use crate::{DatabasePlugin, format_message, truncate_str};
-use ssh::LocalPortForwardTunnel;
+use connection_tunnel::TunnelGuard;
+
+fn is_mysql_access_denied(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("access denied for user")
+}
 
 pub struct MysqlDbConnection {
     config: DbConnectionConfig,
     conn: Arc<Mutex<Option<Conn>>>,
-    tunnel: Option<LocalPortForwardTunnel>,
+    tunnel: Option<TunnelGuard>,
 }
 
 impl MysqlDbConnection {
@@ -118,6 +124,18 @@ impl MysqlDbConnection {
             "invalid MySQL {}: only letters, numbers, and underscores are allowed",
             field_name
         )))
+    }
+
+    fn enrich_connect_error_message(config: &DbConnectionConfig, message: &str) -> String {
+        if !config.get_param_bool("ssh_tunnel_enabled") || !is_mysql_access_denied(message) {
+            return message.to_string();
+        }
+
+        let destination = resolve_tunnel_destination(config);
+        format!(
+            "{message}. SSH tunnel target is {}:{}. Check that the MySQL user host grants allow this source, for example `{}@localhost`, `{}@127.0.0.1`, or `{}@%`.",
+            destination.host, destination.port, config.username, config.username, config.username
+        )
     }
 
     /// Extract value from mysql_async::Value
@@ -270,11 +288,14 @@ impl MysqlDbConnection {
             .collect();
 
         let mut all_rows = Vec::new();
-        while let Some(row) = query_result
-            .next()
-            .await
-            .map_err(|e| DbError::query_with_source("failed to fetch row", e))?
-        {
+        loop {
+            let Some(row) = query_result
+                .next()
+                .await
+                .map_err(|e| DbError::query_with_source("failed to fetch row", e))?
+            else {
+                break;
+            };
             let row_data: Vec<Option<String>> = (0..row.len())
                 .map(|i| Self::extract_value(&row[i]))
                 .collect();
@@ -378,7 +399,11 @@ impl DbConnection for MysqlDbConnection {
             Ok(Ok(conn)) => conn,
             Ok(Err(e)) => {
                 error!("[MySQL] Connection failed: {}", e);
-                return Err(DbError::connection_with_source("failed to connect", e));
+                let message = Self::enrich_connect_error_message(config, &e.to_string());
+                return Err(DbError::Connection {
+                    message: format!("failed to connect: {message}"),
+                    source: Some(Box::new(e)),
+                });
             }
             Err(_) => {
                 error!(
@@ -460,10 +485,17 @@ impl DbConnection for MysqlDbConnection {
                     continue;
                 }
 
-                let sql_preview = if sql.len() > 200 {
-                    format!("{}...", truncate_str(&sql, 200))
+                let sql_to_execute = apply_query_max_rows(
+                    plugin.name(),
+                    sql,
+                    options.max_rows,
+                    plugin.is_query_statement(sql),
+                );
+                let sql_to_execute = sql_to_execute.as_ref();
+                let sql_preview = if sql_to_execute.len() > 200 {
+                    format!("{}...", truncate_str(sql_to_execute, 200))
                 } else {
-                    sql.to_string()
+                    sql_to_execute.to_string()
                 };
                 debug!(
                     "[MySQL] TX executing statement {}/{}: {}",
@@ -473,11 +505,15 @@ impl DbConnection for MysqlDbConnection {
                 );
                 let start = Instant::now();
 
-                let result = match tx.query_iter(sql).await {
+                let result = match tx.query_iter(sql_to_execute).await {
                     Ok(query_result) => {
                         let elapsed_ms = start.elapsed().as_millis();
-                        match Self::process_query_result(query_result, sql.to_string(), elapsed_ms)
-                            .await
+                        match Self::process_query_result(
+                            query_result,
+                            sql_to_execute.to_string(),
+                            elapsed_ms,
+                        )
+                        .await
                         {
                             Ok(result) => result,
                             Err(e) => {
@@ -486,7 +522,7 @@ impl DbConnection for MysqlDbConnection {
                                     e, sql_preview
                                 );
                                 SqlResult::Error(SqlErrorInfo {
-                                    sql: sql.to_string(),
+                                    sql: sql_to_execute.to_string(),
                                     message: e.to_string(),
                                 })
                             }
@@ -498,7 +534,7 @@ impl DbConnection for MysqlDbConnection {
                             e, sql_preview
                         );
                         SqlResult::Error(SqlErrorInfo {
-                            sql: sql.to_string(),
+                            sql: sql_to_execute.to_string(),
                             message: e.to_string(),
                         })
                     }
@@ -545,7 +581,13 @@ impl DbConnection for MysqlDbConnection {
                     idx + 1,
                     statements.len()
                 );
-                let result = Self::execute_single(conn, sql).await?;
+                let sql_to_execute = apply_query_max_rows(
+                    plugin.name(),
+                    sql,
+                    options.max_rows,
+                    plugin.is_query_statement(sql),
+                );
+                let result = Self::execute_single(conn, sql_to_execute.as_ref()).await?;
 
                 let is_error = result.is_error();
                 if is_error {
@@ -667,19 +709,30 @@ impl DbConnection for MysqlDbConnection {
                     };
 
                     current += 1;
-                    let sql_preview = if sql.len() > 200 {
-                        format!("{}...", truncate_str(&sql, 200))
+                    let sql_to_execute = apply_query_max_rows(
+                        plugin.name(),
+                        &sql,
+                        options.max_rows,
+                        plugin.is_query_statement(&sql),
+                    );
+                    let sql_to_execute = sql_to_execute.as_ref();
+                    let sql_preview = if sql_to_execute.len() > 200 {
+                        format!("{}...", truncate_str(sql_to_execute, 200))
                     } else {
-                        sql.clone()
+                        sql_to_execute.to_string()
                     };
                     debug!("[MySQL] Streaming TX statement {}", current);
                     let start = Instant::now();
 
-                    let result = match tx.query_iter(&sql).await {
+                    let result = match tx.query_iter(sql_to_execute).await {
                         Ok(query_result) => {
                             let elapsed_ms = start.elapsed().as_millis();
-                            match Self::process_query_result(query_result, sql.clone(), elapsed_ms)
-                                .await
+                            match Self::process_query_result(
+                                query_result,
+                                sql_to_execute.to_string(),
+                                elapsed_ms,
+                            )
+                            .await
                             {
                                 Ok(result) => result,
                                 Err(e) => {
@@ -688,7 +741,7 @@ impl DbConnection for MysqlDbConnection {
                                         e, sql_preview
                                     );
                                     SqlResult::Error(SqlErrorInfo {
-                                        sql: sql.clone(),
+                                        sql: sql_to_execute.to_string(),
                                         message: e.to_string(),
                                     })
                                 }
@@ -700,7 +753,7 @@ impl DbConnection for MysqlDbConnection {
                                 e, sql_preview
                             );
                             SqlResult::Error(SqlErrorInfo {
-                                sql: sql.clone(),
+                                sql: sql_to_execute.to_string(),
                                 message: e.to_string(),
                             })
                         }
@@ -755,7 +808,13 @@ impl DbConnection for MysqlDbConnection {
                     current += 1;
                     debug!("[MySQL] Streaming statement {}", current);
 
-                    let result = match Self::execute_single(conn, &sql).await {
+                    let sql_to_execute = apply_query_max_rows(
+                        plugin.name(),
+                        &sql,
+                        options.max_rows,
+                        plugin.is_query_statement(&sql),
+                    );
+                    let result = match Self::execute_single(conn, sql_to_execute.as_ref()).await {
                         Ok(r) => r,
                         Err(e) => {
                             let sql_preview = if sql.len() > 200 {
@@ -815,19 +874,30 @@ impl DbConnection for MysqlDbConnection {
 
                 for (index, sql) in statements.into_iter().enumerate() {
                     let current = index + 1;
-                    let sql_preview = if sql.len() > 200 {
-                        format!("{}...", truncate_str(&sql, 200))
+                    let sql_to_execute = apply_query_max_rows(
+                        plugin.name(),
+                        &sql,
+                        options.max_rows,
+                        plugin.is_query_statement(&sql),
+                    );
+                    let sql_to_execute = sql_to_execute.as_ref();
+                    let sql_preview = if sql_to_execute.len() > 200 {
+                        format!("{}...", truncate_str(sql_to_execute, 200))
                     } else {
-                        sql.clone()
+                        sql_to_execute.to_string()
                     };
                     debug!("[MySQL] Streaming TX statement {}/{}", current, total);
                     let start = Instant::now();
 
-                    let result = match tx.query_iter(&sql).await {
+                    let result = match tx.query_iter(sql_to_execute).await {
                         Ok(query_result) => {
                             let elapsed_ms = start.elapsed().as_millis();
-                            match Self::process_query_result(query_result, sql.clone(), elapsed_ms)
-                                .await
+                            match Self::process_query_result(
+                                query_result,
+                                sql_to_execute.to_string(),
+                                elapsed_ms,
+                            )
+                            .await
                             {
                                 Ok(result) => result,
                                 Err(e) => {
@@ -836,7 +906,7 @@ impl DbConnection for MysqlDbConnection {
                                         e, sql_preview
                                     );
                                     SqlResult::Error(SqlErrorInfo {
-                                        sql: sql.clone(),
+                                        sql: sql_to_execute.to_string(),
                                         message: e.to_string(),
                                     })
                                 }
@@ -848,7 +918,7 @@ impl DbConnection for MysqlDbConnection {
                                 e, sql_preview
                             );
                             SqlResult::Error(SqlErrorInfo {
-                                sql: sql.clone(),
+                                sql: sql_to_execute.to_string(),
                                 message: e.to_string(),
                             })
                         }
@@ -879,7 +949,13 @@ impl DbConnection for MysqlDbConnection {
                     let current = index + 1;
                     debug!("[MySQL] Streaming statement {}/{}", current, total);
 
-                    let result = match Self::execute_single(conn, &sql).await {
+                    let sql_to_execute = apply_query_max_rows(
+                        plugin.name(),
+                        &sql,
+                        options.max_rows,
+                        plugin.is_query_statement(&sql),
+                    );
+                    let result = match Self::execute_single(conn, sql_to_execute.as_ref()).await {
                         Ok(r) => r,
                         Err(e) => {
                             let sql_preview = if sql.len() > 200 {
@@ -934,6 +1010,7 @@ mod tests {
             service_name: None,
             sid: None,
             workspace_id: None,
+            proxy: None,
             extra_params: extra_params
                 .iter()
                 .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -1007,5 +1084,46 @@ mod tests {
             .expect_err("invalid charset should fail");
 
         assert!(error.to_string().contains("invalid MySQL charset"));
+    }
+
+    #[test]
+    fn enrich_connect_error_mentions_ssh_target_for_access_denied() {
+        let config = build_config(&[
+            ("ssh_tunnel_enabled", "true"),
+            ("ssh_target_host", "127.0.0.1"),
+            ("ssh_target_port", "3306"),
+        ]);
+
+        let message = MysqlDbConnection::enrich_connect_error_message(
+            &config,
+            "Access denied for user 'root'@'localhost' (using password: YES)",
+        );
+
+        assert!(message.contains("Access denied for user 'root'@'localhost'"));
+        assert!(message.contains("SSH tunnel target is 127.0.0.1:3306"));
+        assert!(message.contains("MySQL user host grants"));
+        assert!(!message.contains("Navicat"));
+    }
+
+    #[test]
+    fn enrich_connect_error_keeps_non_tunnel_errors_unchanged() {
+        let config = build_config(&[]);
+        let message = "Access denied for user 'root'@'localhost'";
+
+        assert_eq!(
+            message,
+            MysqlDbConnection::enrich_connect_error_message(&config, message)
+        );
+    }
+
+    #[test]
+    fn enrich_connect_error_keeps_non_access_denied_tunnel_errors_unchanged() {
+        let config = build_config(&[("ssh_tunnel_enabled", "true")]);
+        let message = "Lost connection to MySQL server during query";
+
+        assert_eq!(
+            message,
+            MysqlDbConnection::enrich_connect_error_message(&config, message)
+        );
     }
 }

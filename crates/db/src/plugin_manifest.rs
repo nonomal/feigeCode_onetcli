@@ -7,8 +7,10 @@ pub const DATABASE_UI_MANIFEST_VERSION: u32 = 1;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatabaseUiManifest {
     pub schema_version: u32,
+    #[serde(default)]
     pub capabilities: DatabaseUiCapabilities,
     pub forms: Vec<DatabaseFormManifest>,
+    #[serde(default)]
     pub actions: DatabaseActionManifest,
 }
 
@@ -23,11 +25,18 @@ impl Default for DatabaseUiManifest {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DatabaseUiCapabilities {
     pub supports_schema: bool,
     pub uses_schema_as_database: bool,
+    pub supports_views: bool,
+    pub supports_indexes: bool,
+    pub supports_users: bool,
+    pub supports_user_create: bool,
+    pub supports_user_edit: bool,
+    pub supports_user_delete: bool,
+    pub supports_user_privileges: bool,
     pub supports_sequences: bool,
     pub supports_functions: bool,
     pub supports_procedures: bool,
@@ -44,6 +53,36 @@ pub struct DatabaseUiCapabilities {
     pub table_engines: Vec<String>,
 }
 
+impl Default for DatabaseUiCapabilities {
+    fn default() -> Self {
+        Self {
+            supports_schema: false,
+            uses_schema_as_database: false,
+            supports_views: true,
+            supports_indexes: true,
+            supports_users: false,
+            supports_user_create: false,
+            supports_user_edit: false,
+            supports_user_delete: false,
+            supports_user_privileges: false,
+            supports_sequences: false,
+            supports_functions: false,
+            supports_procedures: false,
+            supports_triggers: false,
+            supports_table_engine: false,
+            supports_table_charset: false,
+            supports_table_collation: false,
+            supports_auto_increment: false,
+            supports_tablespace: false,
+            supports_unsigned: false,
+            supports_enum_values: false,
+            show_charset_in_column_detail: false,
+            show_collation_in_column_detail: false,
+            table_engines: Vec::new(),
+        }
+    }
+}
+
 pub type DatabaseCapabilities = DatabaseUiCapabilities;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -52,6 +91,10 @@ pub enum DatabaseFormKind {
     CreateDatabase,
     EditDatabase,
     CreateSchema,
+    CreateUser,
+    EditUser,
+    DeleteUser,
+    UserPrivileges,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,4 +267,32 @@ pub enum DatabaseActionToolbarScope {
 pub struct DatabaseFormSubmission {
     pub kind: DatabaseFormKind,
     pub field_values: HashMap<String, String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_user_capabilities_are_disabled() {
+        let capabilities = DatabaseUiCapabilities::default();
+
+        assert!(!capabilities.supports_users);
+        assert!(!capabilities.supports_user_create);
+        assert!(!capabilities.supports_user_edit);
+        assert!(!capabilities.supports_user_delete);
+        assert!(!capabilities.supports_user_privileges);
+    }
+
+    #[test]
+    fn manifest_can_describe_user_operation_forms() {
+        let kinds = [
+            DatabaseFormKind::CreateUser,
+            DatabaseFormKind::EditUser,
+            DatabaseFormKind::DeleteUser,
+            DatabaseFormKind::UserPrivileges,
+        ];
+
+        assert_eq!(4, kinds.len());
+    }
 }

@@ -1,12 +1,16 @@
 //! Redis 连接表单窗口（多标签页）
 
+use connection_form::team::{
+    TeamSelectItem, create_team_select, refresh_team_options, refresh_teams_tooltip,
+    resolve_team_assignment, selected_team_id, team_label,
+};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable, Sizable, Size, TitleBar,
+    ActiveTheme, Disableable, IconName, Sizable, Size,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
@@ -16,12 +20,13 @@ use gpui_component::{
     tab::{Tab, TabBar},
     v_flex,
 };
-use one_core::cloud_sync::{GlobalCloudUser, TeamOption};
+use one_core::cloud_sync::TeamOption;
 use one_core::connection_notifier::{ConnectionDataEvent, get_notifier};
 use one_core::gpui_tokio::Tokio;
 use one_core::storage::traits::Repository;
 use one_core::storage::{
-    RedisClusterConfig, RedisMode, RedisParams, RedisSentinelConfig, StoredConnection, Workspace,
+    ConnectionType, RedisClusterConfig, RedisMode, RedisParams, RedisSentinelConfig,
+    RedisSshTunnelConfig, StoredConnection, Workspace,
 };
 use rust_i18n::t;
 use tracing::error;
@@ -31,8 +36,26 @@ use crate::{RedisConnectionConfig, RedisConnectionMode, RedisManager};
 /// Redis 表单窗口配置
 pub struct RedisFormWindowConfig {
     pub editing_connection: Option<StoredConnection>,
+    pub initial_connection: Option<StoredConnection>,
+    pub on_saved: Option<RedisFormSavedCallback>,
     pub workspaces: Vec<Workspace>,
     pub teams: Vec<TeamOption>,
+    pub ssh_connections: Vec<StoredConnection>,
+}
+
+pub type RedisFormSavedCallback =
+    std::sync::Arc<dyn Fn(StoredConnection, &mut App) + Send + Sync + 'static>;
+
+impl RedisFormWindowConfig {
+    fn is_editing(&self) -> bool {
+        self.editing_connection.is_some()
+    }
+
+    fn connection_to_load(&self) -> Option<&StoredConnection> {
+        self.editing_connection
+            .as_ref()
+            .or(self.initial_connection.as_ref())
+    }
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -70,29 +93,35 @@ impl SelectItem for WorkspaceSelectItem {
 }
 
 #[derive(Clone, Default, PartialEq)]
-struct TeamSelectItem {
-    id: Option<String>,
+struct SshConnectionSelectItem {
+    id: Option<i64>,
     name: String,
 }
 
-impl TeamSelectItem {
-    fn personal() -> Self {
+impl SshConnectionSelectItem {
+    fn none() -> Self {
         Self {
             id: None,
-            name: t!("TeamSync.personal").to_string(),
+            name: t!("ConnectionForm.ssh_connection_manual").to_string(),
         }
     }
 
-    fn from_team(team: &TeamOption) -> Self {
+    fn from_connection(connection: &StoredConnection) -> Self {
+        let host = connection.to_ssh_params().ok().map(|params| params.host);
+        let name = match host.as_deref().filter(|host| !host.trim().is_empty()) {
+            Some(host) => format!("{} ({})", connection.name, host),
+            None => connection.name.clone(),
+        };
+
         Self {
-            id: Some(team.id.clone()),
-            name: team.name.clone(),
+            id: connection.id,
+            name,
         }
     }
 }
 
-impl SelectItem for TeamSelectItem {
-    type Value = Option<String>;
+impl SelectItem for SshConnectionSelectItem {
+    type Value = Option<i64>;
 
     fn title(&self) -> SharedString {
         self.name.clone().into()
@@ -133,11 +162,11 @@ impl ModeSelection {
 /// Redis 连接表单窗口
 pub struct RedisFormWindow {
     focus_handle: FocusHandle,
-    title: SharedString,
     is_editing: bool,
     editing_id: Option<i64>,
     editing_cloud_id: Option<String>,
     editing_last_synced_at: Option<i64>,
+    editing_owner_id: Option<String>,
 
     // 当前活动标签页索引
     active_tab: usize,
@@ -168,6 +197,20 @@ pub struct RedisFormWindow {
     // 高级设置
     use_tls: bool,
     connect_timeout_input: Entity<InputState>,
+    ssh_connections: Vec<StoredConnection>,
+    ssh_connection_select: Entity<SelectState<Vec<SshConnectionSelectItem>>>,
+    ssh_tunnel_enabled: bool,
+    ssh_host_input: Entity<InputState>,
+    ssh_port_input: Entity<InputState>,
+    ssh_username_input: Entity<InputState>,
+    ssh_auth_type: String,
+    ssh_password_input: Entity<InputState>,
+    ssh_private_key_path_input: Entity<InputState>,
+    ssh_private_key_content_input: Entity<InputState>,
+    ssh_private_key_passphrase_input: Entity<InputState>,
+    ssh_target_host_input: Entity<InputState>,
+    ssh_target_port_input: Entity<InputState>,
+    ssh_timeout_input: Entity<InputState>,
 
     // 备注
     remark_input: Entity<InputState>,
@@ -178,11 +221,13 @@ pub struct RedisFormWindow {
     // 测试状态
     is_testing: bool,
     test_result: Option<Result<(), String>>,
+    on_saved: Option<RedisFormSavedCallback>,
 }
 
 impl RedisFormWindow {
     pub fn new(config: RedisFormWindowConfig, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let is_editing = config.editing_connection.is_some();
+        let is_editing = config.is_editing();
+        let connection_to_load = config.connection_to_load().cloned();
         let editing_id = config.editing_connection.as_ref().and_then(|c| c.id);
         let editing_cloud_id = config
             .editing_connection
@@ -192,24 +237,20 @@ impl RedisFormWindow {
             .editing_connection
             .as_ref()
             .and_then(|c| c.last_synced_at);
-
-        let title: SharedString = if is_editing {
-            t!("Redis.edit").to_string()
-        } else {
-            t!("Redis.new").to_string()
-        }
-        .into();
+        let editing_owner_id = config
+            .editing_connection
+            .as_ref()
+            .and_then(|c| c.owner_id.clone());
 
         // 解析现有连接参数
-        let existing_params = config
-            .editing_connection
+        let existing_params = connection_to_load
             .as_ref()
             .and_then(|c| c.to_redis_params().ok());
 
         // 基本信息输入框
         let name_input = cx.new(|cx| {
             let mut state = InputState::new(window, cx).placeholder(t!("Redis.name_placeholder"));
-            if let Some(ref c) = config.editing_connection {
+            if let Some(ref c) = connection_to_load {
                 state.set_value(c.name.clone(), window, cx);
             }
             state
@@ -335,11 +376,123 @@ impl RedisFormWindow {
             state
         });
 
+        let existing_ssh = existing_params.as_ref().and_then(|p| p.ssh_tunnel.as_ref());
+        let mut ssh_items = vec![SshConnectionSelectItem::none()];
+        let ssh_connections: Vec<StoredConnection> = config
+            .ssh_connections
+            .into_iter()
+            .filter(|connection| connection.connection_type == ConnectionType::SshSftp)
+            .collect();
+        ssh_items.extend(
+            ssh_connections
+                .iter()
+                .map(SshConnectionSelectItem::from_connection),
+        );
+        let selected_ssh_connection_id = existing_ssh.and_then(|ssh| ssh.connection_id);
+        let ssh_connection_select = cx.new(|cx| {
+            let mut state = SelectState::new(ssh_items, Some(Default::default()), window, cx);
+            if let Some(id) = selected_ssh_connection_id {
+                state.set_selected_value(&Some(id), window, cx);
+            }
+            state
+        });
+
+        let ssh_host_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("jump.example.com");
+            if let Some(ssh) = existing_ssh {
+                state.set_value(ssh.host.clone(), window, cx);
+            }
+            state
+        });
+
+        let ssh_port_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("22");
+            state.set_value(
+                existing_ssh.map(|ssh| ssh.port).unwrap_or(22).to_string(),
+                window,
+                cx,
+            );
+            state
+        });
+
+        let ssh_username_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("root");
+            if let Some(ssh) = existing_ssh {
+                state.set_value(ssh.username.clone(), window, cx);
+            }
+            state
+        });
+
+        let ssh_password_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx)
+                .placeholder(t!("ConnectionForm.ssh_password"))
+                .masked(true);
+            if let Some(password) = existing_ssh.and_then(|ssh| ssh.password.as_ref()) {
+                state.set_value(password.clone(), window, cx);
+            }
+            state
+        });
+
+        let ssh_private_key_path_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("~/.ssh/id_rsa");
+            if let Some(path) = existing_ssh.and_then(|ssh| ssh.private_key_path.as_ref()) {
+                state.set_value(path.clone(), window, cx);
+            }
+            state
+        });
+
+        let ssh_private_key_content_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx)
+                .placeholder(t!("ConnectionForm.ssh_private_key_content_placeholder"))
+                .auto_grow(5, 14);
+            if let Some(private_key) = existing_ssh.and_then(|ssh| ssh.private_key_content.as_ref())
+            {
+                state.set_value(private_key.clone(), window, cx);
+            }
+            state
+        });
+
+        let ssh_private_key_passphrase_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx)
+                .placeholder(t!("ConnectionForm.ssh_private_key_passphrase"))
+                .masked(true);
+            if let Some(passphrase) =
+                existing_ssh.and_then(|ssh| ssh.private_key_passphrase.as_ref())
+            {
+                state.set_value(passphrase.clone(), window, cx);
+            }
+            state
+        });
+
+        let ssh_target_host_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("127.0.0.1");
+            if let Some(host) = existing_ssh.and_then(|ssh| ssh.target_host.as_ref()) {
+                state.set_value(host.clone(), window, cx);
+            }
+            state
+        });
+
+        let ssh_target_port_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("6379");
+            if let Some(port) = existing_ssh.and_then(|ssh| ssh.target_port) {
+                state.set_value(port.to_string(), window, cx);
+            }
+            state
+        });
+
+        let ssh_timeout_input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx).placeholder("30");
+            if let Some(timeout) = existing_ssh.and_then(|ssh| ssh.timeout) {
+                state.set_value(timeout.to_string(), window, cx);
+            }
+            state
+        });
+
         let remark_input = cx.new(|cx| {
             let mut state = InputState::new(window, cx)
                 .placeholder(t!("Redis.remark_placeholder"))
                 .auto_grow(3, 10);
-            if let Some(ref c) = config.editing_connection {
+            if let Some(ref c) = connection_to_load {
                 if let Some(ref remark) = c.remark {
                     state.set_value(remark.clone(), window, cx);
                 }
@@ -356,10 +509,7 @@ impl RedisFormWindow {
                 .map(WorkspaceSelectItem::from_workspace),
         );
 
-        let selected_workspace_id = config
-            .editing_connection
-            .as_ref()
-            .and_then(|c| c.workspace_id);
+        let selected_workspace_id = connection_to_load.as_ref().and_then(|c| c.workspace_id);
 
         let workspace_select = cx.new(|cx| {
             let mut state = SelectState::new(workspace_items, None, window, cx);
@@ -369,22 +519,9 @@ impl RedisFormWindow {
             state
         });
 
-        // 团队选择
-        let mut team_items = vec![TeamSelectItem::personal()];
-        team_items.extend(config.teams.iter().map(TeamSelectItem::from_team));
-
-        let selected_team_id = config
-            .editing_connection
-            .as_ref()
-            .and_then(|c| c.team_id.clone());
-
-        let team_select = cx.new(|cx| {
-            let mut state = SelectState::new(team_items, Some(Default::default()), window, cx);
-            if let Some(ref team_id) = selected_team_id {
-                state.set_selected_value(&Some(team_id.clone()), window, cx);
-            }
-            state
-        });
+        let selected_team_id = connection_to_load.as_ref().and_then(|c| c.team_id.clone());
+        let team_select =
+            create_team_select(&config.teams, selected_team_id.as_deref(), window, cx);
 
         // 加载模式和高级设置
         let mut mode = ModeSelection::Standalone;
@@ -396,17 +533,17 @@ impl RedisFormWindow {
             use_tls = p.use_tls;
         }
 
-        if let Some(ref c) = config.editing_connection {
+        if let Some(ref c) = connection_to_load {
             sync_enabled = c.sync_enabled;
         }
 
         Self {
             focus_handle: cx.focus_handle(),
-            title,
             is_editing,
             editing_id,
             editing_cloud_id,
             editing_last_synced_at,
+            editing_owner_id,
             active_tab: 0,
             name_input,
             host_input,
@@ -423,10 +560,27 @@ impl RedisFormWindow {
             cluster_nodes_input,
             use_tls,
             connect_timeout_input,
+            ssh_connections,
+            ssh_connection_select,
+            ssh_tunnel_enabled: existing_ssh.is_some_and(|ssh| ssh.enabled),
+            ssh_host_input,
+            ssh_port_input,
+            ssh_username_input,
+            ssh_auth_type: existing_ssh
+                .map(|ssh| ssh.auth_type.clone())
+                .unwrap_or_else(|| "password".to_string()),
+            ssh_password_input,
+            ssh_private_key_path_input,
+            ssh_private_key_content_input,
+            ssh_private_key_passphrase_input,
+            ssh_target_host_input,
+            ssh_target_port_input,
+            ssh_timeout_input,
             remark_input,
             sync_enabled,
             is_testing: false,
             test_result: None,
+            on_saved: config.on_saved,
         }
     }
 
@@ -441,11 +595,83 @@ impl RedisFormWindow {
 
     /// 获取团队 ID
     fn get_team_id(&self, cx: &App) -> Option<String> {
-        self.team_select
+        selected_team_id(&self.team_select, cx)
+    }
+
+    fn request_team_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        refresh_team_options(&self.team_select, window, cx);
+    }
+
+    fn selected_ssh_connection(&self, cx: &App) -> Option<&StoredConnection> {
+        let selected_id = self
+            .ssh_connection_select
             .read(cx)
             .selected_value()
             .cloned()
-            .flatten()
+            .flatten()?;
+        self.ssh_connections
+            .iter()
+            .find(|connection| connection.id == Some(selected_id))
+    }
+
+    fn optional_input_value(input: &Entity<InputState>, cx: &App) -> Option<String> {
+        let value = input.read(cx).text().to_string().trim().to_string();
+        if value.is_empty() { None } else { Some(value) }
+    }
+
+    fn optional_input_u16(input: &Entity<InputState>, cx: &App) -> Option<u16> {
+        input.read(cx).text().to_string().trim().parse::<u16>().ok()
+    }
+
+    fn optional_input_u64(input: &Entity<InputState>, cx: &App) -> Option<u64> {
+        input.read(cx).text().to_string().trim().parse::<u64>().ok()
+    }
+
+    fn build_ssh_tunnel_config(&self, cx: &App) -> Option<RedisSshTunnelConfig> {
+        if !self.ssh_tunnel_enabled {
+            return None;
+        }
+
+        let connection_id = self
+            .ssh_connection_select
+            .read(cx)
+            .selected_value()
+            .cloned()
+            .flatten();
+
+        Some(RedisSshTunnelConfig {
+            enabled: true,
+            connection_id,
+            host: self
+                .ssh_host_input
+                .read(cx)
+                .text()
+                .to_string()
+                .trim()
+                .to_string(),
+            port: Self::optional_input_u16(&self.ssh_port_input, cx).unwrap_or(22),
+            username: self
+                .ssh_username_input
+                .read(cx)
+                .text()
+                .to_string()
+                .trim()
+                .to_string(),
+            auth_type: self.ssh_auth_type.clone(),
+            password: Self::optional_input_value(&self.ssh_password_input, cx),
+            private_key_path: Self::optional_input_value(&self.ssh_private_key_path_input, cx),
+            private_key_content: Self::optional_input_value(
+                &self.ssh_private_key_content_input,
+                cx,
+            ),
+            private_key_passphrase: Self::optional_input_value(
+                &self.ssh_private_key_passphrase_input,
+                cx,
+            ),
+            target_host: Self::optional_input_value(&self.ssh_target_host_input, cx),
+            target_port: Self::optional_input_u16(&self.ssh_target_port_input, cx),
+            timeout: Self::optional_input_u64(&self.ssh_timeout_input, cx),
+        })
     }
 
     /// 构建 RedisParams
@@ -526,7 +752,7 @@ impl RedisFormWindow {
             None
         };
 
-        RedisParams {
+        let mut params = RedisParams {
             host,
             port,
             password,
@@ -537,7 +763,16 @@ impl RedisFormWindow {
             connect_timeout,
             sentinel,
             cluster,
+            ssh_tunnel: self.build_ssh_tunnel_config(cx),
+        };
+
+        if let Some(ssh_connection) = self.selected_ssh_connection(cx) {
+            if let Err(error) = params.apply_referenced_ssh_tunnel(ssh_connection) {
+                tracing::warn!("Failed to apply Redis SSH tunnel reference: {}", error);
+            }
         }
+
+        params
     }
 
     /// 获取 Redis 连接配置（用于测试连接）
@@ -560,6 +795,7 @@ impl RedisFormWindow {
                 ModeSelection::Sentinel => RedisConnectionMode::Sentinel,
                 ModeSelection::Cluster => RedisConnectionMode::Cluster,
             },
+            ssh_tunnel: params.ssh_tunnel,
         }
     }
 
@@ -605,7 +841,19 @@ impl RedisFormWindow {
 
         let workspace_id = self.get_workspace_id(cx);
         let team_id = self.get_team_id(cx);
-        let owner_id = GlobalCloudUser::get_user(cx).map(|u| u.id);
+        let assignment = match resolve_team_assignment(
+            team_id,
+            self.is_editing,
+            self.editing_owner_id.clone(),
+            cx,
+        ) {
+            Ok(assignment) => assignment,
+            Err(error) => {
+                self.test_result = Some(Err(error.to_string()));
+                cx.notify();
+                return;
+            }
+        };
         let remark = {
             let r = self.remark_input.read(cx).text().to_string();
             if r.is_empty() { None } else { Some(r) }
@@ -615,6 +863,7 @@ impl RedisFormWindow {
         let editing_id = self.editing_id;
         let editing_cloud_id = self.editing_cloud_id.clone();
         let editing_last_synced_at = self.editing_last_synced_at;
+        let on_saved = self.on_saved.clone();
 
         let storage = cx
             .global::<one_core::storage::GlobalStorageState>()
@@ -630,10 +879,8 @@ impl RedisFormWindow {
                 let mut conn = StoredConnection::new_redis(name, params, workspace_id);
                 conn.sync_enabled = sync_enabled;
                 conn.remark = remark;
-                conn.team_id = team_id;
-                if !is_editing {
-                    conn.owner_id = owner_id;
-                }
+                conn.team_id = assignment.team_id;
+                conn.owner_id = assignment.owner_id;
 
                 if is_editing {
                     conn.id = editing_id;
@@ -653,21 +900,24 @@ impl RedisFormWindow {
                         if let Some(notifier) = get_notifier(cx) {
                             let event = if is_editing {
                                 ConnectionDataEvent::ConnectionUpdated {
-                                    connection: saved_conn,
+                                    connection: saved_conn.clone(),
                                 }
                             } else {
                                 ConnectionDataEvent::ConnectionCreated {
-                                    connection: saved_conn,
+                                    connection: saved_conn.clone(),
                                 }
                             };
                             notifier.update(cx, |_, cx| {
                                 cx.emit(event);
                             });
                         }
+                        if let Some(on_saved) = &on_saved {
+                            on_saved(saved_conn, cx);
+                        }
                     });
                 }
                 Err(e) => {
-                    tracing::error!(
+                    error!(
                         "{}",
                         t!("Redis.save_connection_failed", error = e).to_string()
                     );
@@ -710,10 +960,23 @@ impl RedisFormWindow {
                 &t!("Redis.workspace"),
                 Select::new(&self.workspace_select).w_full(),
             ))
-            .child(self.render_form_row(
-                &t!("TeamSync.team_label"),
-                Select::new(&self.team_select).w_full(),
-            ))
+            .child(
+                self.render_form_row(
+                    &team_label(),
+                    h_flex()
+                        .gap_2()
+                        .child(Select::new(&self.team_select).w_full())
+                        .child(
+                            Button::new("sync-redis-teams")
+                                .icon(IconName::Refresh)
+                                .ghost()
+                                .tooltip(refresh_teams_tooltip())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.request_team_sync(window, cx);
+                                })),
+                        ),
+                ),
+            )
             .child(
                 self.render_form_row(
                     &t!("ConnectionForm.cloud_sync"),
@@ -820,6 +1083,137 @@ impl RedisFormWindow {
                 &t!("Redis.connect_timeout"),
                 Input::new(&self.connect_timeout_input),
             ))
+            .child(self.render_ssh_tunnel_settings(cx))
+    }
+
+    fn render_ssh_tunnel_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let using_ssh_reference = self
+            .ssh_connection_select
+            .read(cx)
+            .selected_value()
+            .is_some_and(|value| value.is_some());
+        let auth_type = match self.ssh_auth_type.as_str() {
+            "private_key_material" => "private_key_content",
+            value => value,
+        };
+
+        v_flex()
+            .gap_2()
+            .child(
+                self.render_form_row(
+                    &t!("ConnectionForm.ssh_tunnel_enabled"),
+                    Checkbox::new("redis-ssh-tunnel-enabled")
+                        .checked(self.ssh_tunnel_enabled)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.ssh_tunnel_enabled = !this.ssh_tunnel_enabled;
+                            cx.notify();
+                        })),
+                ),
+            )
+            .when(self.ssh_tunnel_enabled, |this| {
+                this.child(self.render_form_row(
+                    &t!("ConnectionForm.ssh_connection_id"),
+                    Select::new(&self.ssh_connection_select).w_full(),
+                ))
+                .when(!using_ssh_reference, |this| {
+                    this.child(self.render_form_row(
+                        &t!("ConnectionForm.ssh_host"),
+                        Input::new(&self.ssh_host_input),
+                    ))
+                    .child(self.render_form_row(
+                        &t!("ConnectionForm.ssh_port"),
+                        Input::new(&self.ssh_port_input),
+                    ))
+                    .child(self.render_form_row(
+                        &t!("ConnectionForm.ssh_username"),
+                        Input::new(&self.ssh_username_input),
+                    ))
+                    .child(
+                        self.render_form_row(
+                            &t!("ConnectionForm.ssh_auth_type"),
+                            h_flex()
+                                .flex_wrap()
+                                .gap_4()
+                                .child(
+                                    Radio::new("redis-ssh-auth-password")
+                                        .label(t!("ConnectionForm.ssh_auth_password").to_string())
+                                        .checked(auth_type == "password")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.ssh_auth_type = "password".to_string();
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Radio::new("redis-ssh-auth-private-key")
+                                        .label(
+                                            t!("ConnectionForm.ssh_auth_private_key").to_string(),
+                                        )
+                                        .checked(auth_type == "private_key")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.ssh_auth_type = "private_key".to_string();
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Radio::new("redis-ssh-auth-private-key-content")
+                                        .label(
+                                            t!("ConnectionForm.ssh_auth_private_key_content")
+                                                .to_string(),
+                                        )
+                                        .checked(auth_type == "private_key_content")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.ssh_auth_type = "private_key_content".to_string();
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Radio::new("redis-ssh-auth-agent")
+                                        .label(t!("ConnectionForm.ssh_auth_agent").to_string())
+                                        .checked(auth_type == "agent")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.ssh_auth_type = "agent".to_string();
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
+                    )
+                    .when(auth_type == "password", |this| {
+                        this.child(self.render_form_row(
+                            &t!("ConnectionForm.ssh_password"),
+                            Input::new(&self.ssh_password_input).mask_toggle(),
+                        ))
+                    })
+                    .when(auth_type == "private_key", |this| {
+                        this.child(self.render_form_row(
+                            &t!("ConnectionForm.ssh_private_key_path"),
+                            Input::new(&self.ssh_private_key_path_input),
+                        ))
+                        .child(self.render_form_row(
+                            &t!("ConnectionForm.ssh_private_key_passphrase"),
+                            Input::new(&self.ssh_private_key_passphrase_input).mask_toggle(),
+                        ))
+                    })
+                    .when(auth_type == "private_key_content", |this| {
+                        this.child(self.render_form_row(
+                            &t!("ConnectionForm.ssh_private_key_content"),
+                            Input::new(&self.ssh_private_key_content_input),
+                        ))
+                        .child(self.render_form_row(
+                            &t!("ConnectionForm.ssh_private_key_passphrase"),
+                            Input::new(&self.ssh_private_key_passphrase_input).mask_toggle(),
+                        ))
+                    })
+                })
+                .child(self.render_form_row(
+                    &t!("ConnectionForm.ssh_target_host"),
+                    Input::new(&self.ssh_target_host_input),
+                ))
+                .child(self.render_form_row(
+                    &t!("ConnectionForm.ssh_target_port"),
+                    Input::new(&self.ssh_target_port_input),
+                ))
+                .child(self.render_form_row("SSH Timeout", Input::new(&self.ssh_timeout_input)))
+            })
     }
 
     /// 渲染其他设置标签页
@@ -860,19 +1254,6 @@ impl Render for RedisFormWindow {
         v_flex()
             .justify_center()
             .size_full()
-            .bg(cx.theme().background)
-            .child(
-                TitleBar::new().child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .flex_1()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(self.title.clone()),
-                ),
-            )
             // TabBar
             .child(
                 div().flex().justify_center().px_3().pt_2().child(
@@ -950,5 +1331,71 @@ impl Render for RedisFormWindow {
                             })),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn redis_connection(name: &str) -> StoredConnection {
+        StoredConnection::new_redis(
+            name.to_string(),
+            RedisParams {
+                host: "127.0.0.1".to_string(),
+                port: 6379,
+                password: None,
+                username: None,
+                db_index: 0,
+                mode: RedisMode::Standalone,
+                use_tls: false,
+                connect_timeout: None,
+                sentinel: None,
+                cluster: None,
+                ssh_tunnel: None,
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn initial_connection_prefills_without_edit_mode() {
+        let connection = redis_connection("imported redis");
+        let config = RedisFormWindowConfig {
+            editing_connection: None,
+            initial_connection: Some(connection),
+            on_saved: None,
+            workspaces: Vec::new(),
+            teams: Vec::new(),
+            ssh_connections: Vec::new(),
+        };
+
+        assert!(!config.is_editing());
+        assert_eq!(
+            Some("imported redis"),
+            config
+                .connection_to_load()
+                .map(|connection| connection.name.as_str())
+        );
+    }
+
+    #[test]
+    fn editing_connection_takes_precedence_over_initial_connection() {
+        let config = RedisFormWindowConfig {
+            editing_connection: Some(redis_connection("existing redis")),
+            initial_connection: Some(redis_connection("imported redis")),
+            on_saved: None,
+            workspaces: Vec::new(),
+            teams: Vec::new(),
+            ssh_connections: Vec::new(),
+        };
+
+        assert!(config.is_editing());
+        assert_eq!(
+            Some("existing redis"),
+            config
+                .connection_to_load()
+                .map(|connection| connection.name.as_str())
+        );
     }
 }

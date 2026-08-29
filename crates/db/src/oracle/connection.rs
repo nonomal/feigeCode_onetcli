@@ -13,15 +13,16 @@ use tracing::{debug, error, info};
 use crate::connection::{DbConnection, DbError, StreamingProgress};
 use crate::executor::{
     ExecOptions, ExecResult, QueryColumnMeta, QueryResult, SqlErrorInfo, SqlResult, SqlSource,
+    apply_query_max_rows,
 };
 use crate::ssh_tunnel::resolve_connection_target;
 use crate::{DatabasePlugin, format_message, truncate_str};
-use ssh::LocalPortForwardTunnel;
+use connection_tunnel::TunnelGuard;
 
 pub struct OracleDbConnection {
     config: DbConnectionConfig,
     conn: Arc<Mutex<Option<oracle::Connection>>>,
-    tunnel: Option<LocalPortForwardTunnel>,
+    tunnel: Option<TunnelGuard>,
 }
 
 impl OracleDbConnection {
@@ -231,6 +232,13 @@ impl OracleDbConnection {
         })
     }
 
+    fn commit_sync(conn: &oracle::Connection) -> Result<(), DbError> {
+        conn.commit().map_err(|e| {
+            error!("[Oracle] Commit failed: {}", e);
+            DbError::transaction_with_source("failed to commit", e)
+        })
+    }
+
     fn execute_statement_sync(conn: &oracle::Connection, sql: &str) -> Result<SqlResult, DbError> {
         let start = Instant::now();
         let sql_string = sql.to_string();
@@ -268,7 +276,11 @@ impl OracleDbConnection {
                                 .collect();
 
                             let mut data_rows = Vec::new();
-                            for row_result in rows {
+                            let mut rows = rows;
+                            loop {
+                                let Some(row_result) = rows.next() else {
+                                    break;
+                                };
                                 match row_result {
                                     Ok(row) => {
                                         let row_data: Vec<Option<String>> = (0..columns.len())
@@ -356,6 +368,10 @@ impl DbConnection for OracleDbConnection {
 
     fn set_config_database(&mut self, database: Option<String>) {
         self.config.database = database;
+    }
+
+    fn ping_query(&self) -> &'static str {
+        "SELECT 1 FROM DUAL"
     }
 
     async fn connect(&mut self) -> Result<(), DbError> {
@@ -462,14 +478,23 @@ impl DbConnection for OracleDbConnection {
         let mut results = Vec::new();
         let conn_arc = self.conn.clone();
         let stop_on_error = options.stop_on_error;
+        let mut saw_exec = false;
+        let mut saw_error = false;
 
         for (idx, sql) in statements.iter().enumerate() {
             let conn_clone = conn_arc.clone();
-            let sql_clone = sql.clone();
-            let sql_preview = if sql.len() > 200 {
-                format!("{}...", truncate_str(&sql, 200))
+            let sql_to_execute = apply_query_max_rows(
+                plugin.name(),
+                sql,
+                options.max_rows,
+                plugin.is_query_statement(sql),
+            )
+            .into_owned();
+            let sql_clone = sql_to_execute.clone();
+            let sql_preview = if sql_to_execute.len() > 200 {
+                format!("{}...", truncate_str(&sql_to_execute, 200))
             } else {
-                sql.clone()
+                sql_to_execute
             };
             debug!(
                 "[Oracle] Executing statement {}/{}",
@@ -490,6 +515,8 @@ impl DbConnection for OracleDbConnection {
             })??;
 
             let is_error = result.is_error();
+            saw_exec |= matches!(result, SqlResult::Exec(_));
+            saw_error |= is_error;
             if is_error {
                 debug!(
                     "[Oracle] Statement {}/{} returned error",
@@ -503,6 +530,21 @@ impl DbConnection for OracleDbConnection {
                 debug!("[Oracle] Stopping execution due to error (stop_on_error=true)");
                 break;
             }
+        }
+
+        if saw_exec && !saw_error {
+            let conn_clone = conn_arc.clone();
+            tokio::task::spawn_blocking(move || {
+                let guard = conn_clone.blocking_lock();
+                let conn = guard.as_ref().ok_or(DbError::NotConnected)?;
+                Self::commit_sync(conn)
+            })
+            .await
+            .map_err(|e| {
+                error!("[Oracle] Commit task error: {}", e);
+                DbError::Internal(format!("task error: {}", e))
+            })??;
+            debug!("[Oracle] Transaction committed");
         }
 
         debug!(
@@ -650,7 +692,14 @@ impl DbConnection for OracleDbConnection {
                 debug!("[Oracle] Streaming statement {}", current);
 
                 let conn_arc = self.conn.clone();
-                let sql_clone = sql.clone();
+                let sql_to_execute = apply_query_max_rows(
+                    plugin.name(),
+                    &sql,
+                    options.max_rows,
+                    plugin.is_query_statement(&sql),
+                )
+                .into_owned();
+                let sql_clone = sql_to_execute.clone();
 
                 let result = match tokio::task::spawn_blocking(move || {
                     let guard = conn_arc.blocking_lock();
@@ -710,7 +759,14 @@ impl DbConnection for OracleDbConnection {
                 debug!("[Oracle] Streaming statement {}/{}", current, total);
 
                 let conn_arc = self.conn.clone();
-                let sql_clone = sql.clone();
+                let sql_to_execute = apply_query_max_rows(
+                    plugin.name(),
+                    &sql,
+                    options.max_rows,
+                    plugin.is_query_statement(&sql),
+                )
+                .into_owned();
+                let sql_clone = sql_to_execute.clone();
 
                 let result = match tokio::task::spawn_blocking(move || {
                     let guard = conn_arc.blocking_lock();
@@ -753,5 +809,37 @@ impl DbConnection for OracleDbConnection {
 
         debug!("[Oracle] execute_streaming() completed");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use one_core::storage::DatabaseType;
+    use std::collections::HashMap;
+
+    fn test_config() -> DbConnectionConfig {
+        DbConnectionConfig {
+            id: "oracle-test".to_string(),
+            database_type: DatabaseType::Oracle,
+            name: "Oracle Test".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 1521,
+            username: "user".to_string(),
+            password: "password".to_string(),
+            database: None,
+            service_name: Some("ORCL".to_string()),
+            sid: None,
+            workspace_id: None,
+            proxy: None,
+            extra_params: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn oracle_ping_uses_dual_for_legacy_oracle_versions() {
+        let connection = OracleDbConnection::new(test_config());
+
+        assert_eq!("SELECT 1 FROM DUAL", connection.ping_query());
     }
 }

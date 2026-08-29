@@ -1,5 +1,6 @@
 //! MongoDB 核心类型定义
 
+use connection_tunnel::SshTunnelConfig;
 use mongodb::bson::{Bson, Document};
 use thiserror::Error;
 
@@ -75,6 +76,9 @@ pub struct MongoConnectionConfig {
     pub id: String,
     pub name: String,
     pub connection_string: String,
+    pub direct_host: String,
+    pub direct_port: u16,
+    pub ssh_tunnel: Option<SshTunnelConfig>,
 }
 
 /// MongoDB 树形节点类型
@@ -163,9 +167,17 @@ impl MongoNode {
 }
 
 pub fn document_to_pretty_json(document: &Document) -> Result<String, MongoError> {
-    let bson =
-        mongodb::bson::to_bson(document).map_err(|e| MongoError::Serialization(e.to_string()))?;
-    serde_json::to_string_pretty(&bson).map_err(|e| MongoError::Serialization(e.to_string()))
+    bson_to_pretty_json(&Bson::Document(document.clone()))
+}
+
+pub fn bson_to_pretty_json(value: &Bson) -> Result<String, MongoError> {
+    let json = value.clone().into_relaxed_extjson();
+    serde_json::to_string_pretty(&json).map_err(|e| MongoError::Serialization(e.to_string()))
+}
+
+pub fn bson_to_compact_json(value: &Bson) -> Result<String, MongoError> {
+    let json = value.clone().into_relaxed_extjson();
+    serde_json::to_string(&json).map_err(|e| MongoError::Serialization(e.to_string()))
 }
 
 pub fn bson_to_string(value: &Bson) -> String {

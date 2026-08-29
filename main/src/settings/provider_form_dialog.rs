@@ -6,7 +6,7 @@ use gpui::{
     Render, SharedString, Styled, WeakEntity, Window, div,
 };
 use gpui_component::{
-    Disableable, IndexPath, WindowExt,
+    ActiveTheme, Disableable, IndexPath, WindowExt,
     button::{Button, ButtonVariant, ButtonVariants},
     h_flex,
     input::{Input, InputState},
@@ -16,10 +16,7 @@ use gpui_component::{
 };
 use one_core::gpui_tokio::Tokio;
 use one_core::llm::manager::GlobalProviderState;
-use one_core::llm::{
-    LlmConnector, LlmProvider,
-    types::{ProviderConfig, ProviderType},
-};
+use one_core::llm::types::{ProviderConfig, ProviderType};
 use rust_i18n::t;
 
 const CUSTOM_MODEL_ID: &str = "__custom__";
@@ -96,6 +93,42 @@ struct ModelRow {
     custom_input: Entity<InputState>,
 }
 
+#[derive(Clone)]
+enum ModelLoadStatusKind {
+    Success,
+    Warning,
+    Error,
+}
+
+#[derive(Clone)]
+struct ModelLoadStatus {
+    kind: ModelLoadStatusKind,
+    message: String,
+}
+
+impl ModelLoadStatus {
+    fn success(message: String) -> Self {
+        Self {
+            kind: ModelLoadStatusKind::Success,
+            message,
+        }
+    }
+
+    fn warning(message: String) -> Self {
+        Self {
+            kind: ModelLoadStatusKind::Warning,
+            message,
+        }
+    }
+
+    fn error(message: String) -> Self {
+        Self {
+            kind: ModelLoadStatusKind::Error,
+            message,
+        }
+    }
+}
+
 /// Provider 表单对话框
 pub struct ProviderForm {
     focus_handle: FocusHandle,
@@ -109,6 +142,7 @@ pub struct ProviderForm {
     model_rows: Vec<ModelRow>,
     is_default: bool,
     models_loading: bool,
+    model_load_status: Option<ModelLoadStatus>,
 }
 
 impl ProviderForm {
@@ -151,8 +185,9 @@ impl ProviderForm {
         });
 
         let api_key_input = cx.new(|cx| {
-            let mut state =
-                InputState::new(window, cx).placeholder(t!("LlmProviders.api_key_placeholder"));
+            let mut state = InputState::new(window, cx)
+                .masked(true)
+                .placeholder(t!("LlmProviders.api_key_placeholder"));
             if let Some(ref cfg) = config {
                 if let Some(ref key) = cfg.api_key {
                     state = state.default_value(key);
@@ -220,6 +255,7 @@ impl ProviderForm {
             model_rows,
             is_default: config.map(|cfg| cfg.is_default).unwrap_or(false),
             models_loading: false,
+            model_load_status: None,
         }
     }
 
@@ -379,6 +415,7 @@ impl ProviderForm {
         }
 
         self.models_loading = true;
+        self.model_load_status = None;
         cx.notify();
 
         let provider_type = self
@@ -434,21 +471,15 @@ impl ProviderForm {
             updated_at: now,
         };
 
-        let is_onet_cli = provider_type.is_builtin();
         let global_provider_state = cx.global::<GlobalProviderState>().clone();
 
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let result = Tokio::spawn(cx, async move {
-                if is_onet_cli {
-                    let provider = global_provider_state
-                        .manager()
-                        .get_provider(&config)
-                        .await?;
-                    provider.models().await
-                } else {
-                    let connector = LlmConnector::from_config(&config)?;
-                    connector.models().await
-                }
+                let provider = global_provider_state
+                    .manager()
+                    .get_provider(&config)
+                    .await?;
+                provider.models().await
             })
             .await;
 
@@ -466,21 +497,37 @@ impl ProviderForm {
                                 form.models_loading = false;
                                 match result {
                                     Ok(models) => {
+                                        let loaded_count = models.len();
                                         if models.is_empty() {
                                             window.push_notification(
                                                 t!("LlmProviders.model_list_empty").to_string(),
                                                 cx,
                                             );
+                                            form.model_load_status =
+                                                Some(ModelLoadStatus::warning(
+                                                    t!("LlmProviders.model_load_empty_inline")
+                                                        .to_string(),
+                                                ));
+                                        } else {
+                                            let message = t!(
+                                                "LlmProviders.model_load_success",
+                                                count = loaded_count
+                                            )
+                                            .to_string();
+                                            window.push_notification(message.clone(), cx);
+                                            form.model_load_status =
+                                                Some(ModelLoadStatus::success(message));
                                         }
                                         let items = Self::build_model_items(&models);
                                         form.refresh_model_items(items, window, cx);
                                     }
                                     Err(message) => {
-                                        window.push_notification(
+                                        let message =
                                             t!("LlmProviders.model_load_failed", error = message)
-                                                .to_string(),
-                                            cx,
-                                        );
+                                                .to_string();
+                                        window.push_notification(message.clone(), cx);
+                                        form.model_load_status =
+                                            Some(ModelLoadStatus::error(message));
                                     }
                                 }
                                 cx.notify();
@@ -636,7 +683,7 @@ impl Render for ProviderForm {
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .child(t!("LlmProviders.api_key_label").to_string()),
                         )
-                        .child(Input::new(&self.api_key_input)),
+                        .child(Input::new(&self.api_key_input).mask_toggle()),
                 )
                 .child(
                     v_flex()
@@ -691,7 +738,15 @@ impl Render for ProviderForm {
                                         view.add_model_row(window, cx);
                                     })),
                             ),
-                    ),
+                    )
+                    .when_some(self.model_load_status.clone(), |this, status| {
+                        let color = match status.kind {
+                            ModelLoadStatusKind::Success => cx.theme().success,
+                            ModelLoadStatusKind::Warning => cx.theme().warning,
+                            ModelLoadStatusKind::Error => cx.theme().danger,
+                        };
+                        this.child(div().text_sm().text_color(color).child(status.message))
+                    }),
             )
             .child(
                 h_flex()

@@ -4,33 +4,47 @@
 //! UI 参考 `sftp_view` 的 `FileListPanel`，但为侧边栏场景做了精简和适配。
 //! 支持文件传输（上传/下载/拖拽），使用独立的传输连接避免阻塞浏览。
 
+use crate::theme::TerminalColors;
 use chrono::{DateTime, Local};
 use gpui::{
-    App, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
-    IntoElement, ListSizingBehavior, MouseButton, MouseDownEvent, ParentElement, PathPromptOptions,
-    Render, SharedString, Styled, UniformListScrollHandle, Window, div, prelude::*, px,
-    uniform_list,
+    Anchor, App, ClipboardItem, Context, Entity, EventEmitter, ExternalPaths, FocusHandle,
+    Focusable, IntoElement, KeyBinding, ListSizingBehavior, MouseButton, MouseDownEvent,
+    ParentElement, PathPromptOptions, Render, SharedString, Styled, UniformListScrollHandle,
+    Window, actions, div, prelude::*, px, uniform_list,
 };
 use gpui_component::{
-    ActiveTheme, Icon, IconName, InteractiveElementExt, Sizable, Size, WindowExt,
+    ActiveTheme, Disableable, Icon, IconName, InteractiveElementExt, Sizable, Size, WindowExt,
     breadcrumb::{Breadcrumb, BreadcrumbItem},
     button::{Button, ButtonVariants},
     dialog::DialogButtonProps,
     h_flex,
     input::{Input, InputEvent, InputState},
-    menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
+    menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
     notification::Notification,
+    popover::{Popover, PopoverState},
     progress::Progress,
+    scroll::ScrollableElement,
     spinner::Spinner,
     tooltip::Tooltip,
     v_flex,
 };
 use one_core::gpui_tokio::Tokio;
+use one_core::sidebar_contribution::SidebarPlacement;
 use one_core::storage::models::StoredConnection;
-use remote_file_editor::open_remote_file_editor;
+use one_core::storage::{
+    GlobalStorageState, SftpFavoritePathRepository, normalize_sftp_favorite_path,
+    sftp_favorite_connection_key,
+};
+use remote_file_editor::{
+    ExternalEditorOpenRequest, RemoteMutationCallback, external_editor_menu_label,
+    external_editors_for_file, open_remote_file_editor, open_remote_file_external_editor,
+};
+use remote_image_preview::{
+    clipboard_upload_paths, image_format_for_path, open_remote_image_preview,
+};
 use rust_i18n::t;
 use sftp::{RusshSftpClient, SftpClient, TransferCancelled, TransferProgress};
-use ssh::SshSessionManager;
+use ssh::{ChannelEvent, SshChannel, SshSessionManager};
 use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
 use std::path::PathBuf;
@@ -38,6 +52,26 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
+
+actions!(terminal_file_manager, [PasteUpload]);
+
+pub const FILE_MANAGER_CONTEXT: &str = "TerminalFileManager";
+
+pub fn init_keybindings() -> Vec<KeyBinding> {
+    vec![KeyBinding::new(
+        file_manager_paste_shortcut(),
+        PasteUpload,
+        Some(FILE_MANAGER_CONTEXT),
+    )]
+}
+
+fn file_manager_paste_shortcut() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "cmd-v"
+    } else {
+        "ctrl-v"
+    }
+}
 
 // ── 传输相关类型 ──────────────────────────────────────────────
 
@@ -53,6 +87,10 @@ enum TransferOperation {
         remote_path: String,
         local_path: PathBuf,
         is_dir: bool,
+    },
+    Delete {
+        targets: Vec<DeleteTarget>,
+        remote_dir: String,
     },
 }
 
@@ -105,6 +143,32 @@ struct PendingUpload {
     remote_path: String,
     is_dir: bool,
     has_conflict: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeleteTarget {
+    name: String,
+    path: String,
+    is_dir: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DownloadTarget {
+    name: String,
+    path: String,
+    is_dir: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveExtract {
+    name: String,
+    path: String,
+}
+
+struct RemoteCommandOutput {
+    stdout: String,
+    stderr: String,
+    exit_status: u32,
 }
 
 /// 传输队列（单任务串行执行）
@@ -247,6 +311,52 @@ fn clear_remote_listing_state<T>(
     selected_indices.clear();
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionMode {
+    Replace,
+    Toggle,
+    Range,
+}
+
+fn selection_mode(shift_pressed: bool, multi_select: bool) -> SelectionMode {
+    if shift_pressed {
+        SelectionMode::Range
+    } else if multi_select {
+        SelectionMode::Toggle
+    } else {
+        SelectionMode::Replace
+    }
+}
+
+fn apply_selection_mode(
+    selected_indices: &mut HashSet<usize>,
+    anchor_index: &mut Option<usize>,
+    row_ix: usize,
+    mode: SelectionMode,
+) {
+    match mode {
+        SelectionMode::Replace => {
+            selected_indices.clear();
+            selected_indices.insert(row_ix);
+            *anchor_index = Some(row_ix);
+        }
+        SelectionMode::Toggle => {
+            if !selected_indices.remove(&row_ix) {
+                selected_indices.insert(row_ix);
+            }
+            *anchor_index = Some(row_ix);
+        }
+        SelectionMode::Range => {
+            let anchor = anchor_index.unwrap_or(row_ix);
+            let start = anchor.min(row_ix);
+            let end = anchor.max(row_ix);
+            selected_indices.clear();
+            selected_indices.extend(start..=end);
+            anchor_index.get_or_insert(row_ix);
+        }
+    }
+}
+
 /// 排序列
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SortColumn {
@@ -276,10 +386,94 @@ struct RemoteFileItem {
 pub enum FileManagerPanelEvent {
     /// 关闭面板
     Close,
+    /// 请求宿主把面板移动到指定位置
+    MoveTo(SidebarPlacement),
     /// 在终端中 cd 到指定路径
     CdToTerminal(String),
     /// 请求将终端当前工作目录同步到文件管理器
     SyncWorkingDir,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameMoveOption {
+    placement: SidebarPlacement,
+    disabled: bool,
+}
+
+fn frame_move_options(current: SidebarPlacement) -> Vec<FrameMoveOption> {
+    [
+        SidebarPlacement::Left,
+        SidebarPlacement::Right,
+        SidebarPlacement::Bottom,
+    ]
+    .into_iter()
+    .map(|placement| FrameMoveOption {
+        placement,
+        disabled: placement == current,
+    })
+    .collect()
+}
+
+fn frame_placement_label(placement: SidebarPlacement) -> &'static str {
+    match placement {
+        SidebarPlacement::Left => "Left",
+        SidebarPlacement::Right => "Right",
+        SidebarPlacement::Bottom => "Bottom",
+    }
+}
+
+fn frame_placement_icon(placement: SidebarPlacement) -> IconName {
+    match placement {
+        SidebarPlacement::Left => IconName::PanelLeft,
+        SidebarPlacement::Right => IconName::PanelRight,
+        SidebarPlacement::Bottom => IconName::PanelBottom,
+    }
+}
+
+fn build_frame_options_menu(
+    menu: PopupMenu,
+    panel: Entity<FileManagerPanel>,
+    placement: SidebarPlacement,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let move_panel = panel.clone();
+    let close_panel = panel.clone();
+    menu.min_w(px(220.0))
+        .submenu_with_icon(
+            Some(IconName::PanelRight.into()),
+            "Move to",
+            window,
+            cx,
+            move |submenu, _window, _cx| {
+                frame_move_options(placement)
+                    .into_iter()
+                    .fold(submenu, |submenu, option| {
+                        let panel = move_panel.clone();
+                        submenu.item(
+                            PopupMenuItem::new(frame_placement_label(option.placement))
+                                .icon(frame_placement_icon(option.placement))
+                                .checked(option.disabled)
+                                .disabled(option.disabled)
+                                .on_click(move |_, _, cx| {
+                                    panel.update(cx, |_this, cx| {
+                                        cx.emit(FileManagerPanelEvent::MoveTo(option.placement));
+                                    });
+                                }),
+                        )
+                    })
+            },
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new("Remove from Sidebar")
+                .icon(IconName::Close)
+                .on_click(move |_, _, cx| {
+                    close_panel.update(cx, |_this, cx| {
+                        cx.emit(FileManagerPanelEvent::Close);
+                    });
+                }),
+        )
 }
 
 // ── 工具函数 ──────────────────────────────────────────────────
@@ -336,12 +530,137 @@ fn join_remote_path(base: &str, name: &str) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArchiveKind {
+    Zip,
+    Tar,
+    TarGz,
+    Tgz,
+    TarBz2,
+    Tbz2,
+    TarXz,
+    Txz,
+    Gzip,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExtractConflictAction {
+    Overwrite,
+    SkipExisting,
+}
+
+fn archive_kind_for_name(name: &str) -> Option<ArchiveKind> {
+    let lower = name.to_lowercase();
+    [
+        (".tar.gz", ArchiveKind::TarGz),
+        (".tar.bz2", ArchiveKind::TarBz2),
+        (".tar.xz", ArchiveKind::TarXz),
+        (".tgz", ArchiveKind::Tgz),
+        (".tbz2", ArchiveKind::Tbz2),
+        (".txz", ArchiveKind::Txz),
+        (".tar", ArchiveKind::Tar),
+        (".zip", ArchiveKind::Zip),
+        (".gz", ArchiveKind::Gzip),
+    ]
+    .into_iter()
+    .find_map(|(suffix, kind)| lower.ends_with(suffix).then_some(kind))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn build_rename_target_path(old_path: &str, new_name: &str) -> String {
+    let parent = remote_path_parent(old_path);
+    join_remote_path(&parent, new_name)
+}
+
+fn build_remote_extract_command(
+    path: &str,
+    name: &str,
+    action: ExtractConflictAction,
+) -> Option<String> {
+    let quoted_path = shell_quote(path);
+    let quoted_parent = shell_quote(&remote_path_parent(path));
+    let tar_skip = match action {
+        ExtractConflictAction::Overwrite => "",
+        ExtractConflictAction::SkipExisting => " --skip-old-files",
+    };
+
+    match (archive_kind_for_name(name)?, action) {
+        (ArchiveKind::Zip, ExtractConflictAction::Overwrite) => {
+            Some(format!("unzip -o -- {quoted_path} -d {quoted_parent}"))
+        }
+        (ArchiveKind::Zip, ExtractConflictAction::SkipExisting) => {
+            Some(format!("unzip -n -- {quoted_path} -d {quoted_parent}"))
+        }
+        (ArchiveKind::Tar, _) => Some(format!(
+            "tar{tar_skip} -xf {quoted_path} -C {quoted_parent}"
+        )),
+        (ArchiveKind::TarGz | ArchiveKind::Tgz, _) => Some(format!(
+            "tar{tar_skip} -xzf {quoted_path} -C {quoted_parent}"
+        )),
+        (ArchiveKind::TarBz2 | ArchiveKind::Tbz2, _) => Some(format!(
+            "tar{tar_skip} -xjf {quoted_path} -C {quoted_parent}"
+        )),
+        (ArchiveKind::TarXz | ArchiveKind::Txz, _) => Some(format!(
+            "tar{tar_skip} -xJf {quoted_path} -C {quoted_parent}"
+        )),
+        (ArchiveKind::Gzip, ExtractConflictAction::Overwrite) => {
+            Some(format!("gzip -dkf -- {quoted_path}"))
+        }
+        (ArchiveKind::Gzip, ExtractConflictAction::SkipExisting) => Some(format!(
+            "test -e {} || gzip -dk -- {quoted_path}",
+            shell_quote(&remote_gzip_target_path(path))
+        )),
+    }
+}
+
+fn remote_gzip_target_path(path: &str) -> String {
+    path.strip_suffix(".gz").unwrap_or(path).to_string()
+}
+
+fn build_archive_top_level_conflict_check_command(path: &str, list_command: String) -> String {
+    let quoted_parent = shell_quote(&remote_path_parent(path));
+    format!(
+        "parent={quoted_parent}; tmp=$(mktemp) || exit 2; if ! {list_command} > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; exit 2; fi; awk -F/ 'NF {{ print $1 }}' \"$tmp\" | sort -u | while IFS= read -r entry; do [ -n \"$entry\" ] || continue; if [ -e \"$parent/$entry\" ]; then printf '%s\\n' \"$entry\"; exit 7; fi; done; status=$?; rm -f \"$tmp\"; if [ \"$status\" -eq 7 ]; then exit 0; fi; exit 1"
+    )
+}
+
+fn build_remote_extract_conflict_check_command(path: &str, name: &str) -> Option<String> {
+    let quoted_path = shell_quote(path);
+    match archive_kind_for_name(name)? {
+        ArchiveKind::Zip => Some(build_archive_top_level_conflict_check_command(
+            path,
+            format!("unzip -Z1 -- {quoted_path}"),
+        )),
+        ArchiveKind::Tar
+        | ArchiveKind::TarGz
+        | ArchiveKind::Tgz
+        | ArchiveKind::TarBz2
+        | ArchiveKind::Tbz2
+        | ArchiveKind::TarXz
+        | ArchiveKind::Txz => Some(build_archive_top_level_conflict_check_command(
+            path,
+            format!("tar -tf {quoted_path}"),
+        )),
+        ArchiveKind::Gzip => Some(format!(
+            "test -e {}",
+            shell_quote(&remote_gzip_target_path(path))
+        )),
+    }
+}
+
 fn should_apply_directory_result(current_path: &str, listed_path: &str) -> bool {
     current_path == listed_path
 }
 
 fn should_refresh_after_upload(current_path: &str, remote_path: &str) -> bool {
     current_path == remote_path_parent(remote_path)
+}
+
+fn should_refresh_after_delete(current_path: &str, remote_dir: &str) -> bool {
+    current_path == remote_dir
 }
 
 fn is_valid_entry_name(name: &str) -> bool {
@@ -357,7 +676,7 @@ fn breadcrumb_item(label: impl Into<SharedString>) -> BreadcrumbItem {
     const BREADCRUMB_ITEM_MAX_WIDTH: f32 = 180.;
 
     BreadcrumbItem::new(label)
-        .flex_shrink()
+        .flex_shrink(1.0)
         .min_w(px(0.))
         .max_w(px(BREADCRUMB_ITEM_MAX_WIDTH))
         .overflow_hidden()
@@ -433,6 +752,210 @@ fn rename_conflicting_uploads(
     uploads
 }
 
+fn delete_targets_for_selection(
+    current_path: &str,
+    items: &[RemoteFileItem],
+    filtered_indices: &[usize],
+    selected_indices: &HashSet<usize>,
+) -> Vec<DeleteTarget> {
+    let mut selected: Vec<_> = selected_indices.iter().copied().collect();
+    selected.sort_unstable();
+
+    selected
+        .into_iter()
+        .filter_map(|filtered_ix| {
+            let real_ix = *filtered_indices.get(filtered_ix)?;
+            let item = items.get(real_ix)?;
+            Some(DeleteTarget {
+                name: item.name.clone(),
+                path: join_remote_path(current_path, &item.name),
+                is_dir: item.is_dir,
+            })
+        })
+        .collect()
+}
+
+fn download_targets_for_selection(
+    current_path: &str,
+    items: &[RemoteFileItem],
+    filtered_indices: &[usize],
+    selected_indices: &HashSet<usize>,
+) -> Vec<DownloadTarget> {
+    let mut selected: Vec<_> = selected_indices.iter().copied().collect();
+    selected.sort_unstable();
+
+    selected
+        .into_iter()
+        .filter_map(|filtered_ix| {
+            let real_ix = *filtered_indices.get(filtered_ix)?;
+            let item = items.get(real_ix)?;
+            Some(DownloadTarget {
+                name: item.name.clone(),
+                path: join_remote_path(current_path, &item.name),
+                is_dir: item.is_dir,
+            })
+        })
+        .collect()
+}
+
+fn should_use_context_selection(selected_indices: &HashSet<usize>, filtered_ix: usize) -> bool {
+    selected_indices.contains(&filtered_ix) && selected_indices.len() > 1
+}
+
+fn delete_target_preview(targets: &[DeleteTarget]) -> String {
+    let mut lines: Vec<String> = targets
+        .iter()
+        .take(5)
+        .map(|target| {
+            let prefix = if target.is_dir { "[dir]" } else { "[file]" };
+            format!("{} {}", prefix, target.name)
+        })
+        .collect();
+
+    if targets.len() > 5 {
+        lines.push(t!("FileManager.and_more", count = targets.len() - 5).to_string());
+    }
+
+    lines.join("\n")
+}
+
+fn update_delete_progress(progress: &SharedProgress, name: &str, transferred: u64, total: u64) {
+    if let Ok(mut guard) = progress.current_file.write() {
+        *guard = Some(name.to_string());
+    }
+    progress.total.store(total, Ordering::Relaxed);
+    progress.transferred.store(transferred, Ordering::Relaxed);
+}
+
+async fn delete_remote_target(
+    client: &mut RusshSftpClient,
+    target: &DeleteTarget,
+    cancelled: Arc<AtomicBool>,
+    progress: Arc<SharedProgress>,
+) -> anyhow::Result<()> {
+    if target.is_dir {
+        let callback_progress = progress;
+        client
+            .delete_recursive(
+                &target.path,
+                cancelled,
+                Box::new(move |progress: TransferProgress| {
+                    callback_progress
+                        .transferred
+                        .store(progress.transferred, Ordering::Relaxed);
+                    callback_progress
+                        .total
+                        .store(progress.total, Ordering::Relaxed);
+                    if let Some(file) = progress.current_file {
+                        if let Ok(mut guard) = callback_progress.current_file.write() {
+                            *guard = Some(file);
+                        }
+                    }
+                }),
+            )
+            .await
+    } else {
+        client.delete(&target.path, false).await
+    }
+}
+
+async fn delete_targets_with_progress(
+    client: Arc<Mutex<RusshSftpClient>>,
+    targets: Vec<DeleteTarget>,
+    progress: Arc<SharedProgress>,
+) -> anyhow::Result<()> {
+    let cancelled = progress.cancelled.clone();
+    let total = targets.len() as u64;
+    let mut client = client.lock().await;
+    let mut errors = Vec::new();
+
+    for (index, target) in targets.iter().enumerate() {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(anyhow::Error::new(TransferCancelled));
+        }
+
+        update_delete_progress(&progress, &target.name, index as u64, total);
+        match delete_remote_target(&mut client, target, cancelled.clone(), progress.clone()).await {
+            Ok(()) => {}
+            Err(error) if is_transfer_cancelled(&error) => return Err(error),
+            Err(error) => errors.push(format!("{}: {}", target.name, error)),
+        }
+        update_delete_progress(&progress, &target.name, (index + 1) as u64, total);
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{}", errors.join("; ")))
+    }
+}
+
+async fn exec_remote_command(
+    session_manager: Arc<SshSessionManager>,
+    command: &str,
+) -> anyhow::Result<String> {
+    let output = exec_remote_command_output(session_manager, command).await?;
+    if output.exit_status != 0 {
+        anyhow::bail!(
+            "remote command exited with status {}: {}",
+            output.exit_status,
+            output.stderr
+        );
+    }
+
+    Ok(output.stdout)
+}
+
+async fn exec_remote_command_output(
+    session_manager: Arc<SshSessionManager>,
+    command: &str,
+) -> anyhow::Result<RemoteCommandOutput> {
+    let mut channel = session_manager.open_channel().await?;
+    channel.exec(command).await?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_status = 0u32;
+
+    while let Some(event) = channel.recv().await {
+        match event {
+            ChannelEvent::Data(data) => stdout.extend(data),
+            ChannelEvent::ExtendedData { data, .. } => stderr.extend(data),
+            ChannelEvent::ExitStatus(status) => exit_status = status,
+            ChannelEvent::ExitSignal {
+                signal_name,
+                error_message,
+            } => {
+                anyhow::bail!("remote command failed with signal {signal_name}: {error_message}");
+            }
+            ChannelEvent::Eof | ChannelEvent::Close => break,
+        }
+    }
+
+    let _ = channel.close().await;
+    Ok(RemoteCommandOutput {
+        stdout: String::from_utf8_lossy(&stdout).to_string(),
+        stderr: String::from_utf8_lossy(&stderr).to_string(),
+        exit_status,
+    })
+}
+
+async fn remote_extract_has_conflict(
+    session_manager: Arc<SshSessionManager>,
+    command: &str,
+) -> anyhow::Result<bool> {
+    let output = exec_remote_command_output(session_manager, command).await?;
+    match output.exit_status {
+        0 => Ok(true),
+        1 => Ok(false),
+        status => anyhow::bail!(
+            "remote conflict check exited with status {}: {}",
+            status,
+            output.stderr
+        ),
+    }
+}
+
 /// 从 StoredConnection 构建 SshConnectConfig
 // ── FileManagerPanel ──────────────────────────────────────────
 
@@ -452,6 +975,8 @@ pub struct FileManagerPanel {
     filtered_indices: Vec<usize>,
     /// 选中项索引（基于 filtered_indices 的下标）
     selected_indices: HashSet<usize>,
+    /// Shift 范围选择的锚点（基于 filtered_indices 的下标）
+    selection_anchor_index: Option<usize>,
     /// 排序列
     sort_column: SortColumn,
     /// 排序方向
@@ -476,6 +1001,13 @@ pub struct FileManagerPanel {
     focus_handle: FocusHandle,
     /// 是否正在加载目录
     loading: bool,
+    favorite_paths: Vec<String>,
+    favorite_connection_id: Option<i64>,
+    favorite_connection_key: String,
+    favorite_popover_open: bool,
+    favorite_search_input: Entity<InputState>,
+    favorite_edit_input: Entity<InputState>,
+    favorite_editing_path: Option<String>,
     /// 订阅
     _subscriptions: Vec<gpui::Subscription>,
 
@@ -488,16 +1020,22 @@ pub struct FileManagerPanel {
     next_task_id: usize,
     /// 进度刷新定时器
     progress_refresh_task: Option<gpui::Task<()>>,
+    active_extract: Option<ActiveExtract>,
     /// 是否有外部文件拖入
     is_dragging_over: bool,
     /// 终端当前工作目录缓存，用于首次连接和导航失败恢复
     working_dir_hint: Option<String>,
+    /// 终端主题配色，用于嵌入侧边栏时保持和终端一致
+    colors: TerminalColors,
+    /// 宿主工具面板当前所在位置
+    frame_placement: SidebarPlacement,
 }
 
 impl FileManagerPanel {
     pub fn new(
-        _stored_connection: StoredConnection,
+        stored_connection: StoredConnection,
         session_manager: Arc<SshSessionManager>,
+        colors: TerminalColors,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -507,6 +1045,15 @@ impl FileManagerPanel {
         });
         let path_input = cx
             .new(|cx| InputState::new(window, cx).placeholder(t!("FileManager.path_placeholder")));
+        let favorite_search_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("FileManager.favorite_search_placeholder"))
+        });
+        let favorite_edit_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("FileManager.favorite_edit_placeholder"))
+        });
+        let favorite_connection_id = stored_connection.id;
+        let favorite_connection_key = sftp_favorite_connection_key(&stored_connection);
+        let favorite_paths = Self::load_favorite_paths(&favorite_connection_key, cx);
 
         let mut subscriptions = Vec::new();
         subscriptions.push(
@@ -515,7 +1062,7 @@ impl FileManagerPanel {
                     let text = input.read(cx).text().to_string();
                     this.search_query = text;
                     this.apply_filter();
-                    this.selected_indices.clear();
+                    this.clear_selection();
                     cx.notify();
                 }
             }),
@@ -533,6 +1080,23 @@ impl FileManagerPanel {
                 _ => {}
             },
         ));
+        subscriptions.push(cx.subscribe(
+            &favorite_search_input,
+            |_this, _, event: &InputEvent, cx| {
+                if let InputEvent::Change = event {
+                    cx.notify();
+                }
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
+            &favorite_edit_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.save_editing_favorite_path(window, cx);
+                }
+            },
+        ));
 
         Self {
             session_manager,
@@ -542,6 +1106,7 @@ impl FileManagerPanel {
             items: Vec::new(),
             filtered_indices: Vec::new(),
             selected_indices: HashSet::new(),
+            selection_anchor_index: None,
             sort_column: SortColumn::Name,
             sort_order: SortOrder::Ascending,
             show_hidden: false,
@@ -554,14 +1119,37 @@ impl FileManagerPanel {
             scroll_handle: UniformListScrollHandle::new(),
             focus_handle,
             loading: false,
+            favorite_paths,
+            favorite_connection_id,
+            favorite_connection_key,
+            favorite_popover_open: false,
+            favorite_search_input,
+            favorite_edit_input,
+            favorite_editing_path: None,
             _subscriptions: subscriptions,
             transfer_client: None,
             transfer_queue: TransferQueue::new(),
             next_task_id: 0,
             progress_refresh_task: None,
+            active_extract: None,
             is_dragging_over: false,
             working_dir_hint: None,
+            colors,
+            frame_placement: SidebarPlacement::Right,
         }
+    }
+
+    pub fn set_colors(&mut self, colors: TerminalColors, cx: &mut Context<Self>) {
+        self.colors = colors;
+        cx.notify();
+    }
+
+    pub fn set_frame_placement(&mut self, placement: SidebarPlacement, cx: &mut Context<Self>) {
+        if self.frame_placement == placement {
+            return;
+        }
+        self.frame_placement = placement;
+        cx.notify();
     }
 
     // ── 连接管理 ──────────────────────────────────────────────
@@ -648,6 +1236,7 @@ impl FileManagerPanel {
                 &mut self.filtered_indices,
                 &mut self.selected_indices,
             );
+            self.selection_anchor_index = None;
         }
     }
 
@@ -770,8 +1359,237 @@ impl FileManagerPanel {
         }
     }
 
+    fn is_current_path_favorite(&self) -> bool {
+        let Some(path) = normalize_sftp_favorite_path(&self.current_path) else {
+            return false;
+        };
+        self.favorite_paths.iter().any(|existing| existing == &path)
+    }
+
+    fn toggle_current_favorite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = normalize_sftp_favorite_path(&self.current_path) else {
+            return;
+        };
+        let Some(repo) = Self::favorite_path_repository(cx) else {
+            window.push_notification(
+                Notification::error(
+                    t!(
+                        "FileManager.favorite_save_failed",
+                        error = "SftpFavoritePathRepository not found"
+                    )
+                    .to_string(),
+                ),
+                cx,
+            );
+            return;
+        };
+
+        let is_favorite = self.is_current_path_favorite();
+        let result = if is_favorite {
+            repo.remove_path(&self.favorite_connection_key, &path)
+        } else {
+            repo.add_path(
+                self.favorite_connection_id,
+                &self.favorite_connection_key,
+                &path,
+            )
+        };
+
+        match result {
+            Ok(false) => return,
+            Ok(true) => {}
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(
+                        t!("FileManager.favorite_save_failed", error = error).to_string(),
+                    ),
+                    cx,
+                );
+                return;
+            }
+        }
+
+        self.refresh_favorite_paths(cx);
+        let message = if is_favorite {
+            t!("FileManager.favorite_removed").to_string()
+        } else {
+            t!("FileManager.favorite_added").to_string()
+        };
+        window.push_notification(Notification::success(message), cx);
+        cx.notify();
+    }
+
+    fn add_favorite_path(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = normalize_sftp_favorite_path(path) else {
+            return;
+        };
+        let Some(repo) = Self::favorite_path_repository(cx) else {
+            window.push_notification(
+                Notification::error(
+                    t!(
+                        "FileManager.favorite_save_failed",
+                        error = "SftpFavoritePathRepository not found"
+                    )
+                    .to_string(),
+                ),
+                cx,
+            );
+            return;
+        };
+
+        match repo.add_path(
+            self.favorite_connection_id,
+            &self.favorite_connection_key,
+            &path,
+        ) {
+            Ok(false) => return,
+            Ok(true) => {
+                self.refresh_favorite_paths(cx);
+                window.push_notification(
+                    Notification::success(t!("FileManager.favorite_added").to_string()),
+                    cx,
+                );
+                cx.notify();
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(
+                        t!("FileManager.favorite_save_failed", error = error).to_string(),
+                    ),
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn refresh_favorite_paths(&mut self, cx: &mut Context<Self>) {
+        self.favorite_paths = Self::load_favorite_paths(&self.favorite_connection_key, cx);
+    }
+
+    fn load_favorite_paths(connection_key: &str, cx: &mut Context<Self>) -> Vec<String> {
+        let Some(repo) = Self::favorite_path_repository(cx) else {
+            tracing::error!("SftpFavoritePathRepository not found");
+            return Vec::new();
+        };
+
+        match repo.list_paths(connection_key) {
+            Ok(paths) => paths,
+            Err(error) => {
+                tracing::error!("Failed to load SFTP favorite paths: {}", error);
+                Vec::new()
+            }
+        }
+    }
+
+    fn favorite_path_repository(cx: &mut Context<Self>) -> Option<Arc<SftpFavoritePathRepository>> {
+        let storage = cx.global::<GlobalStorageState>().storage.clone();
+        storage.get::<SftpFavoritePathRepository>()
+    }
+
+    fn remove_favorite_path(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = Self::favorite_path_repository(cx) else {
+            window.push_notification(
+                Notification::error(
+                    t!(
+                        "FileManager.favorite_save_failed",
+                        error = "SftpFavoritePathRepository not found"
+                    )
+                    .to_string(),
+                ),
+                cx,
+            );
+            return;
+        };
+
+        match repo.remove_path(&self.favorite_connection_key, path) {
+            Ok(false) => return,
+            Ok(true) => {
+                self.refresh_favorite_paths(cx);
+                if self.favorite_editing_path.as_deref() == Some(path) {
+                    self.favorite_editing_path = None;
+                }
+                window.push_notification(
+                    Notification::success(t!("FileManager.favorite_removed").to_string()),
+                    cx,
+                );
+                cx.notify();
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(
+                        t!("FileManager.favorite_save_failed", error = error).to_string(),
+                    ),
+                    cx,
+                );
+            }
+        }
+    }
+
+    fn start_favorite_path_editing(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.favorite_editing_path = Some(path.clone());
+        self.favorite_edit_input.update(cx, |state, cx| {
+            state.set_value(&path, window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn cancel_favorite_path_editing(&mut self, cx: &mut Context<Self>) {
+        if self.favorite_editing_path.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn save_editing_favorite_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(old_path) = self.favorite_editing_path.clone() else {
+            return;
+        };
+        let new_path = self.favorite_edit_input.read(cx).text().to_string();
+        let Some(repo) = Self::favorite_path_repository(cx) else {
+            window.push_notification(
+                Notification::error(
+                    t!(
+                        "FileManager.favorite_save_failed",
+                        error = "SftpFavoritePathRepository not found"
+                    )
+                    .to_string(),
+                ),
+                cx,
+            );
+            return;
+        };
+
+        match repo.update_path(&self.favorite_connection_key, &old_path, &new_path) {
+            Ok(false) => return,
+            Ok(true) => {
+                self.favorite_editing_path = None;
+                self.refresh_favorite_paths(cx);
+                window.push_notification(
+                    Notification::success(t!("FileManager.favorite_updated").to_string()),
+                    cx,
+                );
+                cx.notify();
+            }
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(
+                        t!("FileManager.favorite_save_failed", error = error).to_string(),
+                    ),
+                    cx,
+                );
+            }
+        }
+    }
+
     fn render_path_breadcrumb(&self, cx: &mut Context<Self>) -> Breadcrumb {
-        let mut breadcrumb = Breadcrumb::new();
+        let foreground = self.colors.foreground;
+        let muted_foreground = self.colors.muted_foreground;
+        let mut breadcrumb = Breadcrumb::new().colors(foreground, muted_foreground);
         const MAX_VISIBLE: usize = 4;
 
         if self.current_path == "." {
@@ -884,7 +1702,7 @@ impl FileManagerPanel {
                             .collect();
                         this.sort_items();
                         this.apply_filter();
-                        this.selected_indices.clear();
+                        this.clear_selection();
                     }
                     Ok(Err(e)) => {
                         tracing::error!("列出目录失败: {}", e);
@@ -1000,7 +1818,7 @@ impl FileManagerPanel {
         }
         self.sort_items();
         self.apply_filter();
-        self.selected_indices.clear();
+        self.clear_selection();
         cx.notify();
     }
 
@@ -1027,18 +1845,19 @@ impl FileManagerPanel {
             .collect();
     }
 
-    /// 切换选中状态
-    fn toggle_selection(&mut self, row_ix: usize, multi_select: bool) {
-        if multi_select {
-            if self.selected_indices.contains(&row_ix) {
-                self.selected_indices.remove(&row_ix);
-            } else {
-                self.selected_indices.insert(row_ix);
-            }
-        } else if !self.selected_indices.contains(&row_ix) {
-            self.selected_indices.clear();
-            self.selected_indices.insert(row_ix);
-        }
+    fn clear_selection(&mut self) {
+        self.selected_indices.clear();
+        self.selection_anchor_index = None;
+    }
+
+    /// 更新选中状态
+    fn select_row(&mut self, row_ix: usize, mode: SelectionMode) {
+        apply_selection_mode(
+            &mut self.selected_indices,
+            &mut self.selection_anchor_index,
+            row_ix,
+            mode,
+        );
     }
 
     // ── 传输调度 ──────────────────────────────────────────────
@@ -1132,6 +1951,12 @@ impl FileManagerPanel {
                     task.shared_progress,
                     cx,
                 );
+            }
+            TransferOperation::Delete {
+                targets,
+                remote_dir,
+            } => {
+                self.start_delete_task(task.id, targets, remote_dir, task.shared_progress, cx);
             }
         }
 
@@ -1304,6 +2129,47 @@ impl FileManagerPanel {
             let _ = this.update(cx, |this, cx| {
                 this.update_task_state(task_id, result);
                 this.schedule_transfers(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_delete_task(
+        &mut self,
+        task_id: usize,
+        targets: Vec<DeleteTarget>,
+        remote_dir: String,
+        shared_progress: Arc<SharedProgress>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.transfer_client.clone() else {
+            return;
+        };
+
+        let delete_task = Tokio::spawn(
+            cx,
+            delete_targets_with_progress(client, targets, shared_progress),
+        );
+
+        cx.spawn(async move |this, cx| {
+            let result = match delete_task.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(anyhow::Error::new(e)),
+            };
+            let should_refresh = match &result {
+                Ok(()) => true,
+                Err(error) => !is_transfer_cancelled(error),
+            };
+
+            let _ = this.update(cx, |this, cx| {
+                this.update_task_state(task_id, result);
+                this.schedule_transfers(cx);
+                if should_refresh && should_refresh_after_delete(&this.current_path, &remote_dir) {
+                    this.clear_selection();
+                    this.refresh_dir(cx);
+                }
                 cx.notify();
             });
         })
@@ -1704,6 +2570,39 @@ impl FileManagerPanel {
         self.ensure_transfer_client_and_schedule(cx);
     }
 
+    fn enqueue_delete(
+        &mut self,
+        targets: Vec<DeleteTarget>,
+        remote_dir: String,
+        cx: &mut Context<Self>,
+    ) {
+        if targets.is_empty() {
+            return;
+        }
+
+        let first_file = targets.first().map(|target| target.name.clone());
+        let shared_progress = Arc::new(SharedProgress {
+            transferred: AtomicU64::new(0),
+            total: AtomicU64::new(targets.len() as u64),
+            speed: AtomicU64::new(0),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            current_file: std::sync::RwLock::new(first_file),
+        });
+
+        let task = TransferTask {
+            id: self.alloc_task_id(),
+            operation: TransferOperation::Delete {
+                targets,
+                remote_dir,
+            },
+            state: TransferTaskState::Pending,
+            shared_progress,
+            error: None,
+        };
+        self.transfer_queue.enqueue(task);
+        self.ensure_transfer_client_and_schedule(cx);
+    }
+
     /// 通过文件选择器上传文件
     fn select_and_upload_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let remote_dir = self.current_path.clone();
@@ -1754,6 +2653,43 @@ impl FileManagerPanel {
                 }
             })
             .detach();
+    }
+
+    fn paste_upload_from_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.connection_state != ConnectionState::Connected {
+            window.push_notification(
+                Notification::warning("文件管理器未连接，无法上传剪贴板内容".to_string())
+                    .autohide(true),
+                cx,
+            );
+            return;
+        }
+
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+
+        let upload_paths = match clipboard_upload_paths(&item) {
+            Ok(upload_paths) => upload_paths.paths,
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("读取剪贴板失败：{error}")).autohide(true),
+                    cx,
+                );
+                return;
+            }
+        };
+
+        if upload_paths.is_empty() {
+            window.push_notification(
+                Notification::info("剪贴板没有可上传的文件或图片".to_string()).autohide(true),
+                cx,
+            );
+            return;
+        }
+
+        let remote_dir = self.current_path.clone();
+        self.prepare_uploads(upload_paths, &remote_dir, window, cx);
     }
 
     fn show_new_folder_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1846,20 +2782,461 @@ impl FileManagerPanel {
         });
     }
 
+    fn rename_item(
+        &mut self,
+        name: String,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("FileManager.rename_placeholder"))
+        });
+        let view = cx.entity().downgrade();
+
+        input.update(cx, |state, cx| {
+            state.set_value(&name, window, cx);
+            state.focus(window, cx);
+        });
+
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let view_clone = view.clone();
+            let input_for_callback = input.clone();
+            let old_path = path.clone();
+
+            dialog
+                .title(t!("FileManager.rename").to_string())
+                .w(px(360.))
+                .child(Input::new(&input))
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(t!("FileManager.rename").to_string())
+                        .cancel_text(t!("Common.cancel").to_string()),
+                )
+                .on_ok(move |_, window, cx| {
+                    let new_name = input_for_callback.read(cx).text().to_string();
+                    let new_name = new_name.trim().to_string();
+                    if new_name.is_empty() {
+                        return false;
+                    }
+                    if !is_valid_entry_name(&new_name) {
+                        window.push_notification(
+                            Notification::error(t!("FileManager.invalid_name")),
+                            cx,
+                        );
+                        return false;
+                    }
+
+                    let old_path_for_task = old_path.clone();
+                    let _ = view_clone.update(cx, |this, cx| {
+                        let Some(client) = this.sftp_client.clone() else {
+                            return;
+                        };
+
+                        let old_path = old_path_for_task.clone();
+                        let new_path = build_rename_target_path(&old_path, &new_name);
+                        let task = Tokio::spawn(cx, async move {
+                            let mut client = client.lock().await;
+                            client.rename(&old_path, &new_path).await
+                        });
+
+                        let view = cx.entity().clone();
+                        window
+                            .spawn(cx, async move |cx| match task.await {
+                                Ok(Ok(())) => {
+                                    let _ = view.update_in(cx, |this, window, cx| {
+                                        window.close_dialog(cx);
+                                        this.refresh_dir(cx);
+                                    });
+                                }
+                                Ok(Err(error)) => {
+                                    let message =
+                                        t!("FileManager.rename_failed", error = error).to_string();
+                                    let _ = view.update_in(cx, |_this, window, cx| {
+                                        window.push_notification(Notification::error(message), cx);
+                                    });
+                                }
+                                Err(error) => {
+                                    let message =
+                                        t!("FileManager.rename_failed", error = error).to_string();
+                                    let _ = view.update_in(cx, |_this, window, cx| {
+                                        window.push_notification(Notification::error(message), cx);
+                                    });
+                                }
+                            })
+                            .detach();
+                    });
+                    false
+                })
+        });
+    }
+
+    fn extract_archive(
+        &mut self,
+        name: String,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_extract.is_some() {
+            window.push_notification(Notification::info(t!("FileManager.extract_running")), cx);
+            return;
+        }
+
+        let Some(command) =
+            build_remote_extract_command(&path, &name, ExtractConflictAction::Overwrite)
+        else {
+            window.push_notification(
+                Notification::error(t!("FileManager.extract_unsupported")),
+                cx,
+            );
+            return;
+        };
+
+        let Some(check_command) = build_remote_extract_conflict_check_command(&path, &name) else {
+            window.push_notification(
+                Notification::error(t!("FileManager.extract_unsupported")),
+                cx,
+            );
+            return;
+        };
+
+        let session_manager = self.session_manager.clone();
+        let view = cx.entity().clone();
+        let task = Tokio::spawn(cx, async move {
+            remote_extract_has_conflict(session_manager, &check_command).await
+        });
+
+        window
+            .spawn(cx, async move |cx| match task.await {
+                Ok(Ok(true)) => {
+                    let _ = view.update_in(cx, |this, window, cx| {
+                        this.show_extract_conflict_dialog(name, path, command, window, cx);
+                    });
+                }
+                Ok(Ok(false)) => {
+                    let _ = view.update_in(cx, |this, window, cx| {
+                        this.start_extract_archive(name, path, command, window, cx);
+                    });
+                }
+                Ok(Err(error)) => {
+                    let message = t!("FileManager.extract_check_failed", error = error).to_string();
+                    let _ = view.update_in(cx, |_this, window, cx| {
+                        window.push_notification(Notification::error(message), cx);
+                    });
+                }
+                Err(error) => {
+                    let message = t!("FileManager.extract_check_failed", error = error).to_string();
+                    let _ = view.update_in(cx, |_this, window, cx| {
+                        window.push_notification(Notification::error(message), cx);
+                    });
+                }
+            })
+            .detach();
+    }
+
+    fn show_extract_conflict_dialog(
+        &mut self,
+        name: String,
+        path: String,
+        overwrite_command: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(skip_command) =
+            build_remote_extract_command(&path, &name, ExtractConflictAction::SkipExisting)
+        else {
+            window.push_notification(
+                Notification::error(t!("FileManager.extract_unsupported")),
+                cx,
+            );
+            return;
+        };
+
+        let view = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let view_skip = view.clone();
+            let view_overwrite = view.clone();
+            let skip_name = name.clone();
+            let skip_path = path.clone();
+            let overwrite_name = name.clone();
+            let overwrite_path = path.clone();
+            let skip_command = skip_command.clone();
+            let overwrite_command = overwrite_command.clone();
+
+            dialog
+                .title(t!("FileManager.extract_conflict_title").to_string())
+                .w(px(380.))
+                .child(div().text_sm().child(t!(
+                    "FileManager.extract_conflict_message",
+                    name = name.clone()
+                )))
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("extract-cancel")
+                                .label(t!("Common.cancel").to_string())
+                                .ghost()
+                                .on_click(|_, window, cx| {
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("extract-skip-existing")
+                                .label(t!("FileManager.extract_skip_existing").to_string())
+                                .ghost()
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let _ = view_skip.update(cx, |this, cx| {
+                                        this.start_extract_archive(
+                                            skip_name.clone(),
+                                            skip_path.clone(),
+                                            skip_command.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("extract-overwrite")
+                                .label(t!("Conflict.overwrite").to_string())
+                                .primary()
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let _ = view_overwrite.update(cx, |this, cx| {
+                                        this.start_extract_archive(
+                                            overwrite_name.clone(),
+                                            overwrite_path.clone(),
+                                            overwrite_command.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }),
+                        ),
+                )
+        });
+    }
+
+    fn start_extract_archive(
+        &mut self,
+        name: String,
+        path: String,
+        command: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_extract.is_some() {
+            window.push_notification(Notification::info(t!("FileManager.extract_running")), cx);
+            return;
+        }
+
+        self.active_extract = Some(ActiveExtract {
+            name: name.clone(),
+            path: path.clone(),
+        });
+        cx.notify();
+
+        let session_manager = self.session_manager.clone();
+        let view = cx.entity().clone();
+        let task = Tokio::spawn(cx, async move {
+            exec_remote_command(session_manager, &command).await
+        });
+
+        window
+            .spawn(cx, async move |cx| match task.await {
+                Ok(Ok(_)) => {
+                    let _ = view.update_in(cx, |this, window, cx| {
+                        this.active_extract = None;
+                        window.push_notification(
+                            Notification::success(t!("FileManager.extract_success")),
+                            cx,
+                        );
+                        this.refresh_dir(cx);
+                    });
+                }
+                Ok(Err(error)) => {
+                    let message = t!("FileManager.extract_failed", error = error).to_string();
+                    let _ = view.update_in(cx, |this, window, cx| {
+                        this.active_extract = None;
+                        window.push_notification(Notification::error(message), cx);
+                    });
+                }
+                Err(error) => {
+                    let message = t!("FileManager.extract_failed", error = error).to_string();
+                    let _ = view.update_in(cx, |this, window, cx| {
+                        this.active_extract = None;
+                        window.push_notification(Notification::error(message), cx);
+                    });
+                }
+            })
+            .detach();
+    }
+
+    fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let targets = delete_targets_for_selection(
+            &self.current_path,
+            &self.items,
+            &self.filtered_indices,
+            &self.selected_indices,
+        );
+        self.show_delete_confirmation(targets, window, cx);
+    }
+
+    fn delete_item(
+        &mut self,
+        name: String,
+        path: String,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_delete_confirmation(vec![DeleteTarget { name, path, is_dir }], window, cx);
+    }
+
+    fn delete_context_item_or_selection(
+        &mut self,
+        filtered_ix: usize,
+        name: String,
+        path: String,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if should_use_context_selection(&self.selected_indices, filtered_ix) {
+            self.delete_selected(window, cx);
+        } else {
+            self.delete_item(name, path, is_dir, window, cx);
+        }
+    }
+
+    fn show_delete_confirmation(
+        &mut self,
+        targets: Vec<DeleteTarget>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if targets.is_empty() {
+            return;
+        }
+
+        let remote_dir = self.current_path.clone();
+        let view = cx.entity().downgrade();
+        let file_count = targets.iter().filter(|target| !target.is_dir).count();
+        let dir_count = targets.iter().filter(|target| target.is_dir).count();
+        let confirm_msg = match (file_count, dir_count) {
+            (0, 1) => t!("FileManager.confirm_delete_folder").to_string(),
+            (0, d) => t!("FileManager.confirm_delete_folders", count = d).to_string(),
+            (1, 0) => t!("FileManager.confirm_delete_file").to_string(),
+            (f, 0) => t!("FileManager.confirm_delete_files", count = f).to_string(),
+            (f, d) => t!("FileManager.confirm_delete_mixed", files = f, dirs = d).to_string(),
+        };
+        let target_list = delete_target_preview(&targets);
+
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let view_confirm = view.clone();
+            let targets_confirm = targets.clone();
+            let remote_dir_confirm = remote_dir.clone();
+
+            dialog
+                .title(t!("FileManager.confirm_delete_title").to_string())
+                .w(px(400.))
+                .child(
+                    v_flex().gap_2().child(confirm_msg.clone()).child(
+                        div()
+                            .p_2()
+                            .bg(cx.theme().secondary)
+                            .rounded_md()
+                            .text_sm()
+                            .overflow_hidden()
+                            .child(target_list.clone()),
+                    ),
+                )
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(t!("FileManager.delete").to_string())
+                        .cancel_text(t!("Common.cancel").to_string()),
+                )
+                .on_ok(move |_, window, cx| {
+                    window.close_dialog(cx);
+                    let _ = view_confirm.update(cx, |this, cx| {
+                        this.enqueue_delete(
+                            targets_confirm.clone(),
+                            remote_dir_confirm.clone(),
+                            cx,
+                        );
+                    });
+                    true
+                })
+        });
+    }
+
     /// 通过保存目录选择器下载远程文件/文件夹
     fn download_item(
         &mut self,
         remote_path: String,
         is_dir: bool,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let view = cx.entity().clone();
         let remote_name = remote_path
             .rsplit('/')
             .next()
             .unwrap_or(&remote_path)
             .to_string();
+
+        self.download_targets(
+            vec![DownloadTarget {
+                name: remote_name,
+                path: remote_path,
+                is_dir,
+            }],
+            window,
+            cx,
+        );
+    }
+
+    fn download_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let targets = download_targets_for_selection(
+            &self.current_path,
+            &self.items,
+            &self.filtered_indices,
+            &self.selected_indices,
+        );
+        self.download_targets(targets, window, cx);
+    }
+
+    fn download_context_item_or_selection(
+        &mut self,
+        filtered_ix: usize,
+        remote_path: String,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if should_use_context_selection(&self.selected_indices, filtered_ix) {
+            self.download_selected(window, cx);
+        } else {
+            self.download_item(remote_path, is_dir, window, cx);
+        }
+    }
+
+    fn download_targets(
+        &mut self,
+        targets: Vec<DownloadTarget>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if targets.is_empty() {
+            return;
+        }
+
+        let view = cx.entity().clone();
 
         let future = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -1871,14 +3248,35 @@ impl FileManagerPanel {
         cx.spawn(async move |_this, cx| {
             if let Ok(Ok(Some(paths))) = future.await {
                 if let Some(dir) = paths.first() {
-                    let local_path = dir.join(&remote_name);
                     view.update(cx, |this, cx| {
-                        this.enqueue_download(remote_path, local_path, is_dir, cx);
+                        for target in &targets {
+                            this.enqueue_download(
+                                target.path.clone(),
+                                dir.join(&target.name),
+                                target.is_dir,
+                                cx,
+                            );
+                        }
                     });
                 }
             }
         })
         .detach();
+    }
+
+    fn open_remote_file(&self, full_path: String, window: &mut Window, cx: &mut Context<Self>) {
+        if image_format_for_path(&full_path).is_some() {
+            let Some(client) = self.sftp_client.clone() else {
+                window.push_notification(
+                    Notification::error("SFTP client is not connected".to_string()),
+                    cx,
+                );
+                return;
+            };
+            open_remote_image_preview(full_path, client, window, cx);
+        } else {
+            self.open_remote_editor(full_path, window, cx);
+        }
     }
 
     fn open_remote_editor(&self, full_path: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -1890,7 +3288,40 @@ impl FileManagerPanel {
             return;
         };
 
-        open_remote_file_editor(full_path, client, cx);
+        open_remote_file_editor(full_path, client, self.remote_mutation_callback(cx), cx);
+    }
+
+    fn open_remote_external_editor(
+        &self,
+        selection: (String, String),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (full_path, editor_key) = selection;
+        let Some(client) = self.sftp_client.clone() else {
+            window.push_notification(
+                Notification::error("SFTP client is not connected".to_string()),
+                cx,
+            );
+            return;
+        };
+        open_remote_file_external_editor(
+            ExternalEditorOpenRequest {
+                remote_path: full_path,
+                editor_key,
+                client,
+                on_remote_changed: self.remote_mutation_callback(cx),
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn remote_mutation_callback(&self, cx: &Context<Self>) -> RemoteMutationCallback {
+        let panel = cx.entity().downgrade();
+        RemoteMutationCallback::new(move |cx| {
+            let _ = panel.update(cx, |this, cx| this.refresh_dir(cx));
+        })
     }
 
     // ── 渲染方法 ──────────────────────────────────────────────
@@ -1899,11 +3330,22 @@ impl FileManagerPanel {
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let can_go_back = self.history_index > 0;
         let breadcrumb = self.render_path_breadcrumb(cx);
+        let has_selection = !self.selected_indices.is_empty();
+        let is_connected = self.connection_state == ConnectionState::Connected;
+        let is_favorite = self.is_current_path_favorite();
+        let favorite_paths = self.favorite_paths.clone();
+        let border = self.colors.border;
+        let panel = self.colors.muted;
+        let hover = self.colors.muted.opacity(0.72);
+        let field_bg = self.colors.background;
+        let foreground = self.colors.foreground;
+        let muted_foreground = self.colors.muted_foreground;
+        let accent = self.colors.accent;
 
         v_flex()
             .border_b_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().title_bar)
+            .border_color(border)
+            .bg(panel)
             .child(
                 h_flex()
                     .h_9()
@@ -1918,7 +3360,7 @@ impl FileManagerPanel {
                             .rounded_md()
                             .p(px(5.))
                             .when(!can_go_back, |el| el.opacity(0.4))
-                            .when(can_go_back, |el| el.hover(|s| s.bg(cx.theme().list_active)))
+                            .when(can_go_back, |el| el.hover(move |s| s.bg(hover)))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _window, cx| {
@@ -1932,7 +3374,7 @@ impl FileManagerPanel {
                             .child(
                                 Icon::new(IconName::ArrowLeft)
                                     .small()
-                                    .text_color(cx.theme().muted_foreground),
+                                    .text_color(muted_foreground),
                             ),
                     )
                     // Home 按钮
@@ -1942,7 +3384,7 @@ impl FileManagerPanel {
                             .cursor_pointer()
                             .rounded_md()
                             .p(px(5.))
-                            .hover(|s| s.bg(cx.theme().list_active))
+                            .hover(move |s| s.bg(hover))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _window, cx| {
@@ -1956,7 +3398,7 @@ impl FileManagerPanel {
                             .child(
                                 Icon::new(IconName::Home)
                                     .small()
-                                    .text_color(cx.theme().muted_foreground),
+                                    .text_color(muted_foreground),
                             ),
                     )
                     // 上级目录按钮
@@ -1967,9 +3409,7 @@ impl FileManagerPanel {
                             .rounded_md()
                             .p(px(5.))
                             .when(self.is_at_root(), |el| el.opacity(0.4))
-                            .when(!self.is_at_root(), |el| {
-                                el.hover(|s| s.bg(cx.theme().list_active))
-                            })
+                            .when(!self.is_at_root(), |el| el.hover(move |s| s.bg(hover)))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _window, cx| {
@@ -1983,7 +3423,7 @@ impl FileManagerPanel {
                             .child(
                                 Icon::new(IconName::ArrowUp)
                                     .small()
-                                    .text_color(cx.theme().muted_foreground),
+                                    .text_color(muted_foreground),
                             ),
                     )
                     .child(
@@ -2006,6 +3446,29 @@ impl FileManagerPanel {
                                 this.show_new_folder_dialog(window, cx);
                             })),
                     )
+                    .child(
+                        Button::new("fm-download")
+                            .ghost()
+                            .small()
+                            .icon(IconName::ArrowDown)
+                            .tooltip(t!("FileManager.download"))
+                            .disabled(!has_selection)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.download_selected(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("fm-delete")
+                            .ghost()
+                            .small()
+                            .danger()
+                            .icon(IconName::Remove)
+                            .tooltip(t!("FileManager.delete"))
+                            .disabled(!has_selection)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.delete_selected(window, cx);
+                            })),
+                    )
                     .child(div().flex_1())
                     // 同步终端工作目录按钮
                     .child(
@@ -2014,7 +3477,7 @@ impl FileManagerPanel {
                             .cursor_pointer()
                             .rounded_md()
                             .p(px(5.))
-                            .hover(|s| s.bg(cx.theme().list_active))
+                            .hover(move |s| s.bg(hover))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |_this, _, _window, cx| {
@@ -2028,7 +3491,7 @@ impl FileManagerPanel {
                             .child(
                                 Icon::new(IconName::Sync)
                                     .small()
-                                    .text_color(cx.theme().muted_foreground),
+                                    .text_color(muted_foreground),
                             ),
                     )
                     // 刷新按钮
@@ -2038,7 +3501,7 @@ impl FileManagerPanel {
                             .cursor_pointer()
                             .rounded_md()
                             .p(px(5.))
-                            .hover(|s| s.bg(cx.theme().list_active))
+                            .hover(move |s| s.bg(hover))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _window, cx| {
@@ -2052,7 +3515,7 @@ impl FileManagerPanel {
                             .child(
                                 Icon::new(IconName::Refresh)
                                     .small()
-                                    .text_color(cx.theme().muted_foreground),
+                                    .text_color(muted_foreground),
                             ),
                     )
                     // 隐藏文件开关
@@ -2062,14 +3525,14 @@ impl FileManagerPanel {
                             .cursor_pointer()
                             .rounded_md()
                             .p(px(5.))
-                            .hover(|s| s.bg(cx.theme().list_active))
-                            .when(self.show_hidden, |el| el.bg(cx.theme().list_active))
+                            .hover(move |s| s.bg(hover))
+                            .when(self.show_hidden, |el| el.bg(hover))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _window, cx| {
                                     this.show_hidden = !this.show_hidden;
                                     this.apply_filter();
-                                    this.selected_indices.clear();
+                                    this.clear_selection();
                                     cx.notify();
                                 }),
                             )
@@ -2080,9 +3543,10 @@ impl FileManagerPanel {
                             .child(
                                 Icon::new(IconName::Eye)
                                     .small()
-                                    .text_color(cx.theme().muted_foreground),
+                                    .text_color(muted_foreground),
                             ),
                     )
+                    .child(self.render_frame_options_button(cx))
                     // 关闭按钮
                     .child(
                         div()
@@ -2090,7 +3554,7 @@ impl FileManagerPanel {
                             .cursor_pointer()
                             .rounded_md()
                             .p(px(5.))
-                            .hover(|s| s.bg(cx.theme().list_active))
+                            .hover(move |s| s.bg(hover))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |_this, _, _window, cx| {
@@ -2100,7 +3564,7 @@ impl FileManagerPanel {
                             .child(
                                 Icon::new(IconName::Close)
                                     .small()
-                                    .text_color(cx.theme().muted_foreground),
+                                    .text_color(muted_foreground),
                             ),
                     ),
             )
@@ -2109,6 +3573,7 @@ impl FileManagerPanel {
                     .h_8()
                     .px_2()
                     .pb_2()
+                    .gap_1()
                     .items_center()
                     .child(if self.path_editing {
                         h_flex()
@@ -2118,13 +3583,15 @@ impl FileManagerPanel {
                             .h_7()
                             .px_2()
                             .items_center()
-                            .bg(cx.theme().secondary)
+                            .bg(field_bg)
                             .rounded_md()
                             .child(
                                 Input::new(&self.path_input)
                                     .small()
                                     .appearance(false)
                                     .cleanable(false)
+                                    .text_color(foreground)
+                                    .caret_color(accent)
                                     .w_full(),
                             )
                             .into_any_element()
@@ -2136,10 +3603,11 @@ impl FileManagerPanel {
                             .h_7()
                             .px_2()
                             .items_center()
-                            .bg(cx.theme().secondary)
+                            .bg(field_bg)
+                            .text_color(foreground)
                             .cursor_text()
                             .rounded_md()
-                            .hover(|style| style.bg(cx.theme().list_active))
+                            .hover(move |style| style.bg(hover))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.start_path_editing(window, cx);
                             }))
@@ -2149,15 +3617,247 @@ impl FileManagerPanel {
                                     .build(window, cx)
                             })
                             .into_any_element()
-                    }),
+                    })
+                    .child(
+                        Button::new("fm-toggle-favorite")
+                            .ghost()
+                            .small()
+                            .icon(if is_favorite {
+                                IconName::StarFill
+                            } else {
+                                IconName::Star
+                            })
+                            .tooltip(if is_favorite {
+                                t!("FileManager.favorite_remove_current").to_string()
+                            } else {
+                                t!("FileManager.favorite_add_current").to_string()
+                            })
+                            .disabled(!is_connected)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_current_favorite(window, cx);
+                            })),
+                    )
+                    .child(self.render_favorites_menu(favorite_paths, is_connected, cx)),
             )
     }
 
+    fn render_frame_options_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = cx.entity();
+        let placement = self.frame_placement;
+        Button::new("fm-frame-options")
+            .ghost()
+            .small()
+            .icon(IconName::Ellipsis)
+            .tooltip("面板选项")
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, window, cx| {
+                build_frame_options_menu(menu, panel.clone(), placement, window, cx)
+            })
+    }
+
+    fn render_favorites_menu(
+        &self,
+        favorite_paths: Vec<String>,
+        is_connected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let has_favorites = !favorite_paths.is_empty();
+        let search_input = self.favorite_search_input.clone();
+        let edit_input = self.favorite_edit_input.clone();
+        let editing_path = self.favorite_editing_path.clone();
+        let view = cx.entity().clone();
+        let query = search_input.read(cx).text().to_string().to_lowercase();
+        let query = query.trim().to_string();
+        let filtered_paths: Vec<String> = favorite_paths
+            .into_iter()
+            .filter(|path| query.is_empty() || path.to_lowercase().contains(&query))
+            .collect();
+
+        Popover::new("fm-favorite-paths-popover")
+            .open(self.favorite_popover_open)
+            .on_open_change(cx.listener(|this, open, _window, cx| {
+                this.favorite_popover_open = *open;
+                if !*open {
+                    this.favorite_editing_path = None;
+                }
+                cx.notify();
+            }))
+            .trigger(
+                Button::new("fm-favorite-paths")
+                    .ghost()
+                    .small()
+                    .icon(IconName::FolderOpen)
+                    .tooltip(t!("FileManager.favorite_open").to_string())
+                    .disabled(!is_connected || !has_favorites),
+            )
+            .content(move |_state, window, cx| {
+                let mut list = v_flex().gap_1().max_h(px(320.0)).overflow_y_scrollbar();
+                if filtered_paths.is_empty() {
+                    list = list.child(
+                        div()
+                            .px_2()
+                            .py_3()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t!("FileManager.favorite_no_results").to_string()),
+                    );
+                }
+
+                for path in filtered_paths.iter().cloned() {
+                    let is_editing = editing_path.as_deref() == Some(path.as_str());
+                    list = list.child(Self::render_favorite_path_row(
+                        path,
+                        is_editing,
+                        edit_input.clone(),
+                        view.clone(),
+                        window,
+                        cx,
+                    ));
+                }
+
+                v_flex()
+                    .w(px(360.0))
+                    .max_h(px(420.0))
+                    .gap_2()
+                    .p_2()
+                    .child(
+                        Input::new(&search_input)
+                            .small()
+                            .prefix(Icon::new(IconName::Search).small())
+                            .cleanable(true)
+                            .w_full(),
+                    )
+                    .child(list)
+            })
+    }
+
+    fn render_favorite_path_row(
+        path: String,
+        is_editing: bool,
+        edit_input: Entity<InputState>,
+        view: Entity<FileManagerPanel>,
+        window: &mut Window,
+        cx: &mut Context<PopoverState>,
+    ) -> impl IntoElement {
+        if is_editing {
+            let save_path = path.clone();
+            let cancel_path = path.clone();
+            return h_flex()
+                .id(SharedString::from(format!("fm-favorite-edit-row-{path}")))
+                .gap_1()
+                .items_center()
+                .child(Input::new(&edit_input).small().cleanable(false).flex_1())
+                .child(
+                    Button::new(SharedString::from(format!("fm-favorite-save-{save_path}")))
+                        .icon(IconName::Check)
+                        .ghost()
+                        .small()
+                        .tooltip(t!("FileManager.favorite_save").to_string())
+                        .on_click(window.listener_for(&view, |this, _, window, cx| {
+                            this.save_editing_favorite_path(window, cx);
+                        })),
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "fm-favorite-cancel-{cancel_path}"
+                    )))
+                    .icon(IconName::Close)
+                    .ghost()
+                    .small()
+                    .tooltip(t!("FileManager.favorite_cancel").to_string())
+                    .on_click(window.listener_for(
+                        &view,
+                        |this, _, _window, cx| {
+                            this.cancel_favorite_path_editing(cx);
+                        },
+                    )),
+                )
+                .into_any_element();
+        }
+
+        let navigate_path = path.clone();
+        let edit_path = path.clone();
+        let remove_path = path.clone();
+
+        h_flex()
+            .id(SharedString::from(format!("fm-favorite-row-{path}")))
+            .items_center()
+            .gap_1()
+            .h_9()
+            .px_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(cx.theme().border)
+            .hover(|style| style.bg(cx.theme().list_active))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .gap_2()
+                    .items_center()
+                    .px_2()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        window.listener_for(&view, move |this, _, _window, cx| {
+                            this.navigate_to(navigate_path.clone(), cx);
+                        }),
+                    )
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .with_size(Size::Small)
+                            .text_color(cx.theme().muted_foreground),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_sm()
+                            .text_color(cx.theme().foreground)
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .overflow_hidden()
+                            .child(path),
+                    ),
+            )
+            .child(
+                Button::new(SharedString::from(format!("fm-favorite-edit-{edit_path}")))
+                    .icon(IconName::Edit)
+                    .ghost()
+                    .small()
+                    .tooltip(t!("FileManager.favorite_edit").to_string())
+                    .on_click(window.listener_for(&view, move |this, _, window, cx| {
+                        this.start_favorite_path_editing(edit_path.clone(), window, cx);
+                    })),
+            )
+            .child(
+                Button::new(SharedString::from(format!(
+                    "fm-favorite-remove-{remove_path}"
+                )))
+                .icon(IconName::Remove)
+                .ghost()
+                .small()
+                .tooltip(t!("FileManager.favorite_delete").to_string())
+                .on_click(window.listener_for(
+                    &view,
+                    move |this, _, window, cx| {
+                        this.remove_favorite_path(&remove_path, window, cx);
+                    },
+                )),
+            )
+            .into_any_element()
+    }
+
     /// 渲染搜索栏
-    fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_search_bar(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let has_query = !self.search_query.is_empty();
         let filtered_count = self.filtered_indices.len();
         let total_count = self.items.len();
+        let border = self.colors.border;
+        let background = self.colors.background;
+        let foreground = self.colors.foreground;
+        let muted_foreground = self.colors.muted_foreground;
+        let accent = self.colors.accent;
 
         h_flex()
             .h_8()
@@ -2165,18 +3865,20 @@ impl FileManagerPanel {
             .gap_2()
             .items_center()
             .border_b_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().background)
+            .border_color(border)
+            .bg(background)
             .child(
                 Icon::new(IconName::Search)
                     .xsmall()
-                    .text_color(cx.theme().muted_foreground),
+                    .text_color(muted_foreground),
             )
             .child(
                 div().flex_1().child(
                     Input::new(&self.search_input)
                         .xsmall()
                         .appearance(false)
+                        .text_color(foreground)
+                        .caret_color(accent)
                         .cleanable(has_query),
                 ),
             )
@@ -2184,7 +3886,7 @@ impl FileManagerPanel {
                 el.child(
                     div()
                         .text_xs()
-                        .text_color(cx.theme().muted_foreground)
+                        .text_color(muted_foreground)
                         .child(format!("{}/{}", filtered_count, total_count)),
                 )
             })
@@ -2192,13 +3894,16 @@ impl FileManagerPanel {
 
     /// 渲染排序表头
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = self.colors.border;
+        let panel = self.colors.muted;
+
         h_flex()
             .h_7()
             .px_2()
             .items_center()
             .border_b_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().title_bar)
+            .border_color(border)
+            .bg(panel)
             .child(self.render_header_cell(&t!("FileManager.name"), SortColumn::Name, true, cx))
             .child(self.render_header_cell(&t!("FileManager.size"), SortColumn::Size, false, cx))
             .child(self.render_header_cell(
@@ -2220,6 +3925,8 @@ impl FileManagerPanel {
         let is_sorted = self.sort_column == column;
         let sort_order = self.sort_order;
         let label = label.to_string();
+        let hover = self.colors.muted.opacity(0.72);
+        let muted_foreground = self.colors.muted_foreground;
 
         let base = h_flex()
             .h_full()
@@ -2227,19 +3934,14 @@ impl FileManagerPanel {
             .items_center()
             .gap_0p5()
             .cursor_pointer()
-            .hover(|s| s.bg(cx.theme().list_active))
+            .hover(move |s| s.bg(hover))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _window, cx| {
                     this.set_sort(column, cx);
                 }),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(label),
-            )
+            .child(div().text_xs().text_color(muted_foreground).child(label))
             .when(is_sorted, |el| {
                 el.child(
                     Icon::new(if sort_order == SortOrder::Ascending {
@@ -2248,7 +3950,7 @@ impl FileManagerPanel {
                         IconName::ChevronDown
                     })
                     .xsmall()
-                    .text_color(cx.theme().muted_foreground),
+                    .text_color(muted_foreground),
                 )
             });
 
@@ -2264,16 +3966,20 @@ impl FileManagerPanel {
         &self,
         item: &RemoteFileItem,
         is_selected: bool,
-        cx: &App,
+        _cx: &App,
     ) -> impl IntoElement {
         let name = item.name.clone();
         let is_dir = item.is_dir;
+        let foreground = self.colors.foreground;
+        let muted_foreground = self.colors.muted_foreground;
+        let selection = self.colors.accent.opacity(0.24);
 
         h_flex()
             .h(px(36.))
             .px_2()
             .items_center()
-            .when(is_selected, |el| el.bg(cx.theme().selection))
+            .text_color(foreground)
+            .when(is_selected, |el| el.bg(selection))
             // 名称列
             .child(
                 h_flex()
@@ -2310,7 +4016,7 @@ impl FileManagerPanel {
                 div()
                     .w(px(50.))
                     .text_xs()
-                    .text_color(cx.theme().muted_foreground)
+                    .text_color(muted_foreground)
                     .child(if is_dir {
                         "-".to_string()
                     } else {
@@ -2322,7 +4028,7 @@ impl FileManagerPanel {
                 div()
                     .w(px(70.))
                     .text_xs()
-                    .text_color(cx.theme().muted_foreground)
+                    .text_color(muted_foreground)
                     .overflow_hidden()
                     .text_ellipsis()
                     .whitespace_nowrap()
@@ -2332,10 +4038,13 @@ impl FileManagerPanel {
 
     /// 渲染上级目录行（..）
     fn render_parent_row(&self, _cx: &App) -> impl IntoElement {
+        let foreground = self.colors.foreground;
+
         h_flex()
             .h(px(36.))
             .px_2()
             .items_center()
+            .text_color(foreground)
             .child(
                 h_flex()
                     .flex_1()
@@ -2351,19 +4060,28 @@ impl FileManagerPanel {
     /// 构建文件项右键菜单
     fn build_context_menu(
         menu: PopupMenu,
+        filtered_ix: usize,
         name: &str,
         full_path: &str,
         is_dir: bool,
         view: &Entity<Self>,
         window: &mut Window,
-        _cx: &mut Context<PopupMenu>,
+        cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
         let path_for_cd = full_path.to_string();
         let path_for_copy = full_path.to_string();
         let name_for_copy = name.to_string();
+        let name_for_rename = name.to_string();
+        let path_for_rename = full_path.to_string();
         let path_for_download = full_path.to_string();
         let is_dir_for_download = is_dir;
         let path_for_edit = full_path.to_string();
+        let name_for_extract = name.to_string();
+        let path_for_extract = full_path.to_string();
+        let path_for_favorite = full_path.to_string();
+        let name_for_delete = name.to_string();
+        let path_for_delete = full_path.to_string();
+        let is_dir_for_delete = is_dir;
 
         let mut menu = menu;
 
@@ -2374,9 +4092,26 @@ impl FileManagerPanel {
                 .icon(IconName::ArrowDown)
                 .on_click(
                     window.listener_for(&view_download, move |this, _, window, cx| {
-                        this.download_item(
+                        this.download_context_item_or_selection(
+                            filtered_ix,
                             path_for_download.clone(),
                             is_dir_for_download,
+                            window,
+                            cx,
+                        );
+                    }),
+                ),
+        );
+
+        let view_rename = view.clone();
+        menu = menu.item(
+            PopupMenuItem::new(t!("FileManager.rename"))
+                .icon(IconName::Edit)
+                .on_click(
+                    window.listener_for(&view_rename, move |this, _, window, cx| {
+                        this.rename_item(
+                            name_for_rename.clone(),
+                            path_for_rename.clone(),
                             window,
                             cx,
                         );
@@ -2390,20 +4125,69 @@ impl FileManagerPanel {
                 PopupMenuItem::new(t!("Common.edit"))
                     .icon(IconName::Edit)
                     .on_click(window.listener_for(&view_edit, move |this, _, window, cx| {
-                        this.open_remote_editor(path_for_edit.clone(), window, cx);
+                        this.open_remote_file(path_for_edit.clone(), window, cx);
                     })),
             );
+
+            for editor in external_editors_for_file(name, cx) {
+                let view_external = view.clone();
+                let path_for_external = full_path.to_string();
+                let editor_key = editor.editor_key;
+                menu = menu.item(
+                    PopupMenuItem::new(external_editor_menu_label(&editor.display_name))
+                        .icon(IconName::Edit)
+                        .on_click(window.listener_for(
+                            &view_external,
+                            move |this, _, window, cx| {
+                                this.open_remote_external_editor(
+                                    (path_for_external.clone(), editor_key.clone()),
+                                    window,
+                                    cx,
+                                );
+                            },
+                        )),
+                );
+            }
+
+            if archive_kind_for_name(name).is_some() {
+                let view_extract = view.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(t!("FileManager.extract"))
+                        .icon(IconName::Unarchive)
+                        .on_click(window.listener_for(
+                            &view_extract,
+                            move |this, _, window, cx| {
+                                this.extract_archive(
+                                    name_for_extract.clone(),
+                                    path_for_extract.clone(),
+                                    window,
+                                    cx,
+                                );
+                            },
+                        )),
+                );
+            }
         }
 
         // 文件夹：在终端中 CD
         if is_dir {
             let view_cd = view.clone();
+            let view_favorite = view.clone();
             menu = menu.item(
                 PopupMenuItem::new(t!("FileManager.cd_to_terminal"))
                     .icon(IconName::SquareTerminal)
                     .on_click(window.listener_for(&view_cd, move |_this, _, _, cx| {
                         cx.emit(FileManagerPanelEvent::CdToTerminal(path_for_cd.clone()));
                     })),
+            );
+            menu = menu.item(
+                PopupMenuItem::new(t!("FileManager.favorite_add_path"))
+                    .icon(IconName::Star)
+                    .on_click(
+                        window.listener_for(&view_favorite, move |this, _, window, cx| {
+                            this.add_favorite_path(&path_for_favorite, window, cx);
+                        }),
+                    ),
             );
         }
 
@@ -2434,8 +4218,26 @@ impl FileManagerPanel {
         // 分隔线 + 上传文件 + 上传文件夹 + 刷新
         let view_upload_files = view.clone();
         let view_upload_folder = view.clone();
+        let view_delete = view.clone();
         let view_refresh = view.clone();
         menu = menu
+            .separator()
+            .item(
+                PopupMenuItem::new(t!("FileManager.delete"))
+                    .icon(IconName::Remove)
+                    .on_click(
+                        window.listener_for(&view_delete, move |this, _, window, cx| {
+                            this.delete_context_item_or_selection(
+                                filtered_ix,
+                                name_for_delete.clone(),
+                                path_for_delete.clone(),
+                                is_dir_for_delete,
+                                window,
+                                cx,
+                            );
+                        }),
+                    ),
+            )
             .separator()
             .item(
                 PopupMenuItem::new(t!("FileManager.upload_file"))
@@ -2474,6 +4276,10 @@ impl FileManagerPanel {
         let Some(task) = self.transfer_queue.active_task() else {
             return div().into_any_element();
         };
+        let border = self.colors.border;
+        let panel = self.colors.muted;
+        let hover = self.colors.muted.opacity(0.72);
+        let muted_foreground = self.colors.muted_foreground;
 
         let (icon, label) = match &task.operation {
             TransferOperation::Upload { local_path, .. } => (
@@ -2487,6 +4293,10 @@ impl FileManagerPanel {
                 let name = remote_path.rsplit('/').next().unwrap_or(remote_path);
                 (IconName::ArrowDown, name.to_string())
             }
+            TransferOperation::Delete { targets, .. } => (
+                IconName::Remove,
+                t!("FileManager.delete_n_items", count = targets.len()).to_string(),
+            ),
         };
 
         let transferred = task.shared_progress.transferred.load(Ordering::Relaxed);
@@ -2522,8 +4332,8 @@ impl FileManagerPanel {
 
         v_flex()
             .border_t_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().title_bar)
+            .border_color(border)
+            .bg(panel)
             .px_2()
             .py_1()
             .gap_1()
@@ -2532,11 +4342,7 @@ impl FileManagerPanel {
                 h_flex()
                     .gap_1()
                     .items_center()
-                    .child(
-                        Icon::new(icon)
-                            .xsmall()
-                            .text_color(cx.theme().muted_foreground),
-                    )
+                    .child(Icon::new(icon).xsmall().text_color(muted_foreground))
                     .child(
                         div()
                             .id("fm-transfer-name")
@@ -2553,7 +4359,7 @@ impl FileManagerPanel {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(cx.theme().muted_foreground)
+                            .text_color(muted_foreground)
                             .child(status_text),
                     )
                     .when(
@@ -2565,7 +4371,7 @@ impl FileManagerPanel {
                                     .cursor_pointer()
                                     .rounded_md()
                                     .p(px(2.))
-                                    .hover(|s| s.bg(cx.theme().list_active))
+                                    .hover(move |s| s.bg(hover))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, _window, cx| {
@@ -2575,7 +4381,7 @@ impl FileManagerPanel {
                                     .child(
                                         Icon::new(IconName::Close)
                                             .xsmall()
-                                            .text_color(cx.theme().muted_foreground),
+                                            .text_color(muted_foreground),
                                     ),
                             )
                         },
@@ -2595,7 +4401,7 @@ impl FileManagerPanel {
                         el.child(
                             div()
                                 .text_xs()
-                                .text_color(cx.theme().muted_foreground)
+                                .text_color(muted_foreground)
                                 .child(format!("+{}", pending_count)),
                         )
                     }),
@@ -2603,8 +4409,55 @@ impl FileManagerPanel {
             .into_any_element()
     }
 
+    fn render_extract_progress(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(extract) = self.active_extract.clone() else {
+            return div().into_any_element();
+        };
+        let tooltip_label = extract.path.clone();
+        let border = self.colors.border;
+        let panel = self.colors.muted;
+        let muted_foreground = self.colors.muted_foreground;
+
+        h_flex()
+            .border_t_1()
+            .border_color(border)
+            .bg(panel)
+            .px_2()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .child(Spinner::new().small())
+            .child(
+                Icon::new(IconName::Unarchive)
+                    .xsmall()
+                    .text_color(muted_foreground),
+            )
+            .child(
+                div()
+                    .id("fm-extract-name")
+                    .flex_1()
+                    .text_xs()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(extract.name)
+                    .tooltip(move |window, cx| {
+                        Tooltip::new(tooltip_label.clone()).build(window, cx)
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted_foreground)
+                    .child(t!("FileManager.extract_running")),
+            )
+            .into_any_element()
+    }
+
     /// 渲染拖拽覆盖层
-    fn render_drop_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_drop_overlay(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let foreground = self.colors.foreground;
+
         div()
             .absolute()
             .top_0()
@@ -2622,14 +4475,16 @@ impl FileManagerPanel {
                     div()
                         .text_sm()
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(cx.theme().foreground)
+                        .text_color(foreground)
                         .child(t!("FileManager.drop_files_here")),
                 ),
             )
     }
 
     /// 渲染连接中状态
-    fn render_connecting(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_connecting(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let muted_foreground = self.colors.muted_foreground;
+
         v_flex()
             .size_full()
             .items_center()
@@ -2639,13 +4494,16 @@ impl FileManagerPanel {
             .child(
                 div()
                     .text_sm()
-                    .text_color(cx.theme().muted_foreground)
+                    .text_color(muted_foreground)
                     .child(t!("FileManager.connecting")),
             )
     }
 
     /// 渲染错误状态
     fn render_error(&self, error: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let accent = self.colors.accent;
+        let accent_foreground = self.colors.accent_foreground;
+
         v_flex()
             .size_full()
             .items_center()
@@ -2673,8 +4531,8 @@ impl FileManagerPanel {
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(cx.theme().primary)
-                    .text_color(cx.theme().primary_foreground)
+                    .bg(accent)
+                    .text_color(accent_foreground)
                     .text_sm()
                     .hover(|s| s.opacity(0.9))
                     .on_mouse_down(
@@ -2689,6 +4547,10 @@ impl FileManagerPanel {
 
     /// 渲染初始状态（提示连接）
     fn render_idle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let accent = self.colors.accent;
+        let accent_foreground = self.colors.accent_foreground;
+        let muted_foreground = self.colors.muted_foreground;
+
         v_flex()
             .size_full()
             .items_center()
@@ -2699,12 +4561,12 @@ impl FileManagerPanel {
                 Icon::new(IconName::FolderOpen)
                     .color()
                     .with_size(Size::Large)
-                    .text_color(cx.theme().muted_foreground),
+                    .text_color(muted_foreground),
             )
             .child(
                 div()
                     .text_sm()
-                    .text_color(cx.theme().muted_foreground)
+                    .text_color(muted_foreground)
                     .child(t!("FileManager.title")),
             )
             .child(
@@ -2714,8 +4576,8 @@ impl FileManagerPanel {
                     .px_3()
                     .py_1()
                     .rounded_md()
-                    .bg(cx.theme().primary)
-                    .text_color(cx.theme().primary_foreground)
+                    .bg(accent)
+                    .text_color(accent_foreground)
                     .text_sm()
                     .hover(|s| s.opacity(0.9))
                     .on_mouse_down(
@@ -2740,10 +4602,14 @@ impl FileManagerPanel {
         let scroll_handle = self.scroll_handle.clone();
         let is_loading = self.loading;
         let has_active_transfer = self.transfer_queue.has_active();
+        let has_active_extract = self.active_extract.is_some();
         let is_dragging = self.is_dragging_over;
+        let background = self.colors.background;
+        let hover = self.colors.muted.opacity(0.72);
 
         v_flex()
             .size_full()
+            .bg(background)
             .child(self.render_toolbar(cx))
             .child(self.render_search_bar(cx))
             .child(self.render_header(cx))
@@ -2762,7 +4628,11 @@ impl FileManagerPanel {
                     div()
                         .id("fm-file-list-drop-zone")
                         .flex_1()
+                        .min_h_0()
+                        .min_w_0()
                         .relative()
+                        .overflow_hidden()
+                        .bg(background)
                         // 拖拽上传支持
                         .drag_over::<ExternalPaths>(|el, _, _, _cx| el.bg(gpui::rgba(0x3b82f620)))
                         .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
@@ -2788,7 +4658,7 @@ impl FileManagerPanel {
                                                     return div()
                                                         .id(list_ix)
                                                         .cursor_pointer()
-                                                        .hover(|s| s.bg(cx.theme().list_hover))
+                                                        .hover(move |s| s.bg(hover))
                                                         .on_double_click(cx.listener(
                                                             move |this, _, _window, cx| {
                                                                 this.go_parent(cx);
@@ -2821,7 +4691,7 @@ impl FileManagerPanel {
                                                 div()
                                                     .id(list_ix)
                                                     .cursor_pointer()
-                                                    .hover(|s| s.bg(cx.theme().list_hover))
+                                                    .hover(move |s| s.bg(hover))
                                                     .on_mouse_down(
                                                         MouseButton::Left,
                                                         cx.listener(
@@ -2829,11 +4699,13 @@ impl FileManagerPanel {
                                                                   event: &MouseDownEvent,
                                                                   _window,
                                                                   cx| {
-                                                                let multi_select =
-                                                                    event.modifiers.secondary();
-                                                                this.toggle_selection(
+                                                                let mode = selection_mode(
+                                                                    event.modifiers.shift,
+                                                                    event.modifiers.secondary(),
+                                                                );
+                                                                this.select_row(
                                                                     filtered_ix,
-                                                                    multi_select,
+                                                                    mode,
                                                                 );
                                                                 cx.notify();
                                                             },
@@ -2848,7 +4720,7 @@ impl FileManagerPanel {
                                                                     cx,
                                                                 );
                                                             } else {
-                                                                this.open_remote_editor(
+                                                                this.open_remote_file(
                                                                     fp.clone(),
                                                                     window,
                                                                     cx,
@@ -2860,6 +4732,7 @@ impl FileManagerPanel {
                                                         move |menu, window, cx| {
                                                             Self::build_context_menu(
                                                                 menu,
+                                                                filtered_ix,
                                                                 &ctx_name,
                                                                 &ctx_full_path,
                                                                 ctx_is_dir,
@@ -2885,12 +4758,16 @@ impl FileManagerPanel {
                             .track_scroll(&scroll_handle)
                             .with_sizing_behavior(ListSizingBehavior::Auto),
                         )
+                        .vertical_scrollbar(&scroll_handle)
                         .when(is_dragging, |el| el.child(self.render_drop_overlay(cx))),
                 )
             })
             // 底部传输进度条
             .when(has_active_transfer, |el| {
                 el.child(self.render_transfer_progress(cx))
+            })
+            .when(!has_active_transfer && has_active_extract, |el| {
+                el.child(self.render_extract_progress(cx))
             })
     }
 }
@@ -2920,10 +4797,18 @@ impl Focusable for FileManagerPanel {
 impl Render for FileManagerPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.connection_state.clone();
+        let background = self.colors.background;
+        let foreground = self.colors.foreground;
 
         v_flex()
             .size_full()
-            .bg(cx.theme().background)
+            .track_focus(&self.focus_handle)
+            .key_context(FILE_MANAGER_CONTEXT)
+            .on_action(cx.listener(|this, _: &PasteUpload, window, cx| {
+                this.paste_upload_from_clipboard(window, cx);
+            }))
+            .bg(background)
+            .text_color(foreground)
             .child(match state {
                 ConnectionState::Idle => self.render_idle(cx).into_any_element(),
                 ConnectionState::Connecting => self.render_connecting(cx).into_any_element(),
@@ -2937,9 +4822,10 @@ impl Render for FileManagerPanel {
 mod tests {
     use super::{
         ConnectionState, NavigationRecoveryPlan, build_navigation_recovery_plan,
-        build_retry_reset_plan, clear_remote_listing_state, should_apply_directory_result,
-        should_refresh_after_upload,
+        build_retry_reset_plan, clear_remote_listing_state, frame_move_options,
+        should_apply_directory_result, should_refresh_after_upload,
     };
+    use one_core::sidebar_contribution::SidebarPlacement;
     use std::collections::HashSet;
 
     #[test]
@@ -2999,6 +4885,23 @@ mod tests {
     }
 
     #[test]
+    fn frame_move_options_disable_current_placement() {
+        let options = frame_move_options(SidebarPlacement::Left);
+
+        assert_eq!(
+            vec![
+                (SidebarPlacement::Left, true),
+                (SidebarPlacement::Right, false),
+                (SidebarPlacement::Bottom, false),
+            ],
+            options
+                .iter()
+                .map(|option| (option.placement, option.disabled))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn only_apply_directory_result_for_active_path() {
         assert!(should_apply_directory_result("/srv/app", "/srv/app"));
         assert!(!should_apply_directory_result("/srv/other", "/srv/app"));
@@ -3011,5 +4914,262 @@ mod tests {
             "/srv/other",
             "/srv/app/file.txt"
         ));
+    }
+
+    #[test]
+    fn delete_targets_follow_filtered_selection_order() {
+        let items = vec![
+            super::RemoteFileItem {
+                name: "app.log".to_string(),
+                size: 10,
+                modified: std::time::UNIX_EPOCH,
+                is_dir: false,
+            },
+            super::RemoteFileItem {
+                name: "conf".to_string(),
+                size: 0,
+                modified: std::time::UNIX_EPOCH,
+                is_dir: true,
+            },
+            super::RemoteFileItem {
+                name: "data.db".to_string(),
+                size: 20,
+                modified: std::time::UNIX_EPOCH,
+                is_dir: false,
+            },
+        ];
+        let filtered_indices = vec![1, 0, 2];
+        let selected_indices = HashSet::from([0usize, 2usize]);
+
+        let targets = super::delete_targets_for_selection(
+            "/srv/app",
+            &items,
+            &filtered_indices,
+            &selected_indices,
+        );
+
+        assert_eq!(2, targets.len());
+        assert_eq!("conf", targets[0].name);
+        assert_eq!("/srv/app/conf", targets[0].path);
+        assert!(targets[0].is_dir);
+        assert_eq!("data.db", targets[1].name);
+        assert_eq!("/srv/app/data.db", targets[1].path);
+        assert!(!targets[1].is_dir);
+    }
+
+    #[test]
+    fn download_targets_follow_filtered_selection_order() {
+        let items = vec![
+            super::RemoteFileItem {
+                name: "app.log".to_string(),
+                size: 10,
+                modified: std::time::UNIX_EPOCH,
+                is_dir: false,
+            },
+            super::RemoteFileItem {
+                name: "conf".to_string(),
+                size: 0,
+                modified: std::time::UNIX_EPOCH,
+                is_dir: true,
+            },
+            super::RemoteFileItem {
+                name: "data.db".to_string(),
+                size: 20,
+                modified: std::time::UNIX_EPOCH,
+                is_dir: false,
+            },
+        ];
+        let filtered_indices = vec![1, 0, 2];
+        let selected_indices = HashSet::from([0usize, 2usize]);
+
+        let targets = super::download_targets_for_selection(
+            "/srv/app",
+            &items,
+            &filtered_indices,
+            &selected_indices,
+        );
+
+        assert_eq!(
+            vec![
+                super::DownloadTarget {
+                    name: "conf".to_string(),
+                    path: "/srv/app/conf".to_string(),
+                    is_dir: true,
+                },
+                super::DownloadTarget {
+                    name: "data.db".to_string(),
+                    path: "/srv/app/data.db".to_string(),
+                    is_dir: false,
+                },
+            ],
+            targets
+        );
+    }
+
+    #[test]
+    fn context_menu_uses_selection_only_for_selected_multi_item() {
+        let selected_indices = HashSet::from([0usize, 2usize]);
+
+        assert!(super::should_use_context_selection(&selected_indices, 0));
+        assert!(super::should_use_context_selection(&selected_indices, 2));
+        assert!(!super::should_use_context_selection(&selected_indices, 1));
+
+        let single_selection = HashSet::from([0usize]);
+        assert!(!super::should_use_context_selection(&single_selection, 0));
+    }
+
+    #[test]
+    fn range_selection_selects_rows_between_anchor_and_clicked_row() {
+        let mut selected_indices = HashSet::from([1usize]);
+        let mut anchor_index = Some(1usize);
+
+        super::apply_selection_mode(
+            &mut selected_indices,
+            &mut anchor_index,
+            4,
+            super::SelectionMode::Range,
+        );
+
+        assert_eq!(HashSet::from([1usize, 2, 3, 4]), selected_indices);
+        assert_eq!(Some(1), anchor_index);
+    }
+
+    #[test]
+    fn range_selection_without_anchor_selects_clicked_row() {
+        let mut selected_indices = HashSet::new();
+        let mut anchor_index = None;
+
+        super::apply_selection_mode(
+            &mut selected_indices,
+            &mut anchor_index,
+            3,
+            super::SelectionMode::Range,
+        );
+
+        assert_eq!(HashSet::from([3usize]), selected_indices);
+        assert_eq!(Some(3), anchor_index);
+    }
+
+    #[test]
+    fn replace_selection_clears_previous_rows_and_updates_anchor() {
+        let mut selected_indices = HashSet::from([0usize, 2]);
+        let mut anchor_index = Some(0usize);
+
+        super::apply_selection_mode(
+            &mut selected_indices,
+            &mut anchor_index,
+            5,
+            super::SelectionMode::Replace,
+        );
+
+        assert_eq!(HashSet::from([5usize]), selected_indices);
+        assert_eq!(Some(5), anchor_index);
+    }
+
+    #[test]
+    fn build_rename_target_path_keeps_parent_directory() {
+        assert_eq!(
+            "/srv/app/new.log",
+            super::build_rename_target_path("/srv/app/old.log", "new.log")
+        );
+        assert_eq!(
+            "/renamed.log",
+            super::build_rename_target_path("/old.log", "renamed.log")
+        );
+    }
+
+    #[test]
+    fn archive_kind_detects_supported_remote_archives() {
+        assert_eq!(
+            Some(super::ArchiveKind::Zip),
+            super::archive_kind_for_name("APP.ZIP")
+        );
+        assert_eq!(
+            Some(super::ArchiveKind::TarGz),
+            super::archive_kind_for_name("release.tar.gz")
+        );
+        assert_eq!(
+            Some(super::ArchiveKind::Tgz),
+            super::archive_kind_for_name("release.tgz")
+        );
+        assert_eq!(None, super::archive_kind_for_name("notes.txt"));
+    }
+
+    #[test]
+    fn build_remote_extract_command_quotes_paths_and_uses_archive_parent() {
+        assert_eq!(
+            Some("unzip -o -- '/srv/a'\\''b/app.zip' -d '/srv/a'\\''b'".to_string()),
+            super::build_remote_extract_command(
+                "/srv/a'b/app.zip",
+                "app.zip",
+                super::ExtractConflictAction::Overwrite
+            )
+        );
+        assert_eq!(
+            Some("tar -xzf '/tmp/release.tar.gz' -C '/tmp'".to_string()),
+            super::build_remote_extract_command(
+                "/tmp/release.tar.gz",
+                "release.tar.gz",
+                super::ExtractConflictAction::Overwrite
+            )
+        );
+        assert_eq!(
+            None,
+            super::build_remote_extract_command(
+                "/tmp/readme.md",
+                "readme.md",
+                super::ExtractConflictAction::Overwrite
+            )
+        );
+    }
+
+    #[test]
+    fn build_remote_extract_command_can_skip_existing_targets() {
+        assert_eq!(
+            Some("unzip -n -- '/tmp/app.zip' -d '/tmp'".to_string()),
+            super::build_remote_extract_command(
+                "/tmp/app.zip",
+                "app.zip",
+                super::ExtractConflictAction::SkipExisting
+            )
+        );
+        assert_eq!(
+            Some("tar --skip-old-files -xzf '/tmp/release.tar.gz' -C '/tmp'".to_string()),
+            super::build_remote_extract_command(
+                "/tmp/release.tar.gz",
+                "release.tar.gz",
+                super::ExtractConflictAction::SkipExisting
+            )
+        );
+        assert_eq!(
+            Some("test -e '/tmp/app.log' || gzip -dk -- '/tmp/app.log.gz'".to_string()),
+            super::build_remote_extract_command(
+                "/tmp/app.log.gz",
+                "app.log.gz",
+                super::ExtractConflictAction::SkipExisting
+            )
+        );
+    }
+
+    #[test]
+    fn build_remote_extract_conflict_check_command_detects_existing_targets() {
+        assert_eq!(
+            Some("test -e '/tmp/app.log'".to_string()),
+            super::build_remote_extract_conflict_check_command("/tmp/app.log.gz", "app.log.gz")
+        );
+
+        let zip_command =
+            super::build_remote_extract_conflict_check_command("/srv/a'b/app.zip", "app.zip")
+                .unwrap();
+        assert!(zip_command.contains("parent='/srv/a'\\''b'"));
+        assert!(zip_command.contains("unzip -Z1 -- '/srv/a'\\''b/app.zip'"));
+        assert!(zip_command.contains("[ -e \"$parent/$entry\" ]"));
+
+        let tar_command = super::build_remote_extract_conflict_check_command(
+            "/tmp/release.tar.gz",
+            "release.tar.gz",
+        )
+        .unwrap();
+        assert!(tar_command.contains("tar -tf '/tmp/release.tar.gz'"));
     }
 }
