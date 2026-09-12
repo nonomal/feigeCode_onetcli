@@ -1,24 +1,27 @@
-use gpui::{
-    App, AppContext as _, ClickEvent, Context, Entity, Focusable, IntoElement, ParentElement as _,
-    Render, Styled, Window, px,
+use gpui_kit::{
+    App, AppContext as _, ClickEvent, Context, Entity, Focusable, InteractiveElement, IntoElement,
+    ParentElement as _, Render, Styled, Subscription, Window, div, px,
 };
 
 use crate::section;
-use gpui_component::{
-    Sizable,
+use gpui_kit::component::{
+    ActiveTheme as _, Sizable,
     button::Button,
     h_flex,
-    input::{Input, InputState},
+    input::{InputEvent, Textarea, TextareaState},
     v_flex,
 };
 
 pub fn init(_: &mut App) {}
 
 pub struct TextareaStory {
-    textarea: Entity<InputState>,
-    textarea_auto_grow: Entity<InputState>,
-    textarea_no_wrap: Entity<InputState>,
-    textarea_auto_grow_no_wrap: Entity<InputState>,
+    textarea: Entity<TextareaState>,
+    textarea_auto_grow: Entity<TextareaState>,
+    textarea_no_wrap: Entity<TextareaState>,
+    textarea_auto_grow_no_wrap: Entity<TextareaState>,
+    chat_input: Entity<TextareaState>,
+    chat_messages: Vec<String>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl super::Story for TextareaStory {
@@ -46,8 +49,7 @@ impl TextareaStory {
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let textarea = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .rows(10)
                 .placeholder("Enter text here...")
                 .searchable(true)
@@ -76,15 +78,14 @@ impl TextareaStory {
         });
 
         let textarea_no_wrap = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .rows(6)
                 .soft_wrap(false)
                 .default_value("This is a very long line of text to test if the horizontal scrolling function is working properly, and it should not wrap automatically but display a horizontal scrollbar.\nThe second line is also very long text, used to test the horizontal scrolling effect under multiple lines, and you can input more content to test.\nThe third line: Here you can input other long text content that requires horizontal scrolling.\n")
         });
 
         let textarea_auto_grow = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(1, 5)
                 .placeholder("Enter text here...")
                 .default_value(
@@ -101,18 +102,46 @@ impl TextareaStory {
         });
 
         let textarea_auto_grow_no_wrap = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(1, 5)
                 .soft_wrap(false)
                 .placeholder("Enter text here...")
                 .default_value("Hello 世界，this is GPUI component.")
         });
 
+        let chat_input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 5)
+                .submit_on_enter(true)
+                .placeholder("Type a message, Enter to send, Shift+Enter for newline")
+        });
+
+        let _subscriptions = vec![cx.subscribe_in(
+            &chat_input,
+            window,
+            |this: &mut Self, input, event, window, cx| match event {
+                InputEvent::PressEnter { shift, .. } if !shift => {
+                    let text = input.read(cx).value().trim().to_string();
+                    if !text.is_empty() {
+                        this.chat_messages.push(text);
+                        input.update(cx, |state, cx| {
+                            state.set_value("", window, cx);
+                        });
+                        cx.notify();
+                    }
+                }
+                _ => {}
+            },
+        )];
+
         Self {
             textarea,
             textarea_auto_grow,
             textarea_no_wrap,
             textarea_auto_grow_no_wrap,
+            chat_input,
+            chat_messages: Vec::new(),
+            _subscriptions,
         }
     }
 
@@ -140,7 +169,7 @@ impl TextareaStory {
 }
 
 impl Focusable for TextareaStory {
-    fn focus_handle(&self, cx: &gpui::App) -> gpui::FocusHandle {
+    fn focus_handle(&self, cx: &gpui_kit::App) -> gpui_kit::FocusHandle {
         self.textarea.focus_handle(cx)
     }
 }
@@ -153,11 +182,11 @@ impl Render for TextareaStory {
             .w_full()
             .gap_3()
             .child(
-                section("Textarea").child(
+                section("Textarea").w(px(560.)).child(
                     v_flex()
                         .gap_2()
                         .w_full()
-                        .child(Input::new(&self.textarea).h(px(320.)))
+                        .child(Textarea::new(&self.textarea).h(px(320.)))
                         .child(
                             h_flex()
                                 .justify_between()
@@ -189,18 +218,37 @@ impl Render for TextareaStory {
             )
             .child(
                 section("No Wrap")
-                    .max_w_md()
-                    .child(Input::new(&self.textarea_no_wrap).h(px(200.))),
+                    .w(px(560.))
+                    .child(Textarea::new(&self.textarea_no_wrap).h(px(200.))),
             )
             .child(
                 section("Auto Grow")
-                    .max_w_md()
-                    .child(Input::new(&self.textarea_auto_grow)),
+                    .w(px(560.))
+                    .child(Textarea::new(&self.textarea_auto_grow)),
             )
             .child(
                 section("Auto Grow with No Wrap")
-                    .max_w_md()
-                    .child(Input::new(&self.textarea_auto_grow_no_wrap)),
+                    .w(px(560.))
+                    .child(Textarea::new(&self.textarea_auto_grow_no_wrap)),
+            )
+            .child(
+                section("Submit on Enter (Chat)").w(px(560.)).child(
+                    v_flex()
+                        .gap_2()
+                        .w_full()
+                        .child(v_flex().gap_1().children(
+                            self.chat_messages.iter().enumerate().map(|(i, msg)| {
+                                div()
+                                    .id(("chat-msg", i))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded(cx.theme().radius)
+                                    .bg(cx.theme().muted)
+                                    .child(msg.clone())
+                            }),
+                        ))
+                        .child(Textarea::new(&self.chat_input)),
+                ),
             )
     }
 }
